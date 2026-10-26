@@ -102,10 +102,22 @@ ARCH_TAG = replace(PYTORCH_ROCM_ARCH, ";", "_")
 
 # Shared OCI provenance. Without revision and created there is no way to
 # work back from a running container to the commit that built it.
+#
+# Deliberately NOT applied to pytorch-base. Labels live in the image
+# config, so a changing revision or created gives the base a new digest
+# even when its content is identical — and every downstream FROM then
+# invalidates, re-cloning PyTorch's submodule tree and re-running pip on
+# every commit. Provenance belongs on the artifacts we ship; the base is
+# an intermediate and should stay content-addressed.
 OCI_LABELS = {
   "org.opencontainers.image.source"   = SOURCE_URL
   "org.opencontainers.image.revision" = VCS_REF
   "org.opencontainers.image.created"  = BUILD_DATE
+}
+
+# What the base gets instead: identity, nothing that varies per build.
+BASE_LABELS = {
+  "org.opencontainers.image.source" = SOURCE_URL
 }
 
 # Shared compiler cache on Strix, reachable from every build node. The
@@ -172,7 +184,7 @@ target "pytorch-base" {
     "${REGISTRY}/${REGISTRY_NAME}/base:latest",
     VCS_REF != "" ? "${REGISTRY}/${REGISTRY_NAME}/base:${ROCM_VERSION}-${PYTHON_VERSION}-g${VCS_REF}" : "",
   ])
-  labels = merge(OCI_LABELS, {
+  labels = merge(BASE_LABELS, {
     "org.opencontainers.image.title"       = "rocm-pytorch base"
     "org.opencontainers.image.description" = "ROCm ${ROCM_VERSION} dev base with Python ${PYTHON_VERSION}"
     "org.opencontainers.image.version"     = "${ROCM_VERSION}-${PYTHON_VERSION}"

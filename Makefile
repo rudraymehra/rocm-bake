@@ -47,7 +47,12 @@ GAMING_HOST ?= snoc-gaming
 # suffix when the tree has uncommitted changes, so an image built from
 # edited sources can never be mistaken for the commit it came from.
 VCS_REF ?= $(shell git rev-parse --short HEAD 2>/dev/null)$(shell git diff --quiet 2>/dev/null || echo -dirty)
-BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+# The commit's own timestamp, not "now". OCI's `created` is meant to
+# describe the artifact, and wall-clock time made every rebuild of the
+# same commit produce a different image config — hence a different
+# digest, invalidating every downstream FROM. Falls back to now outside
+# a git tree.
+BUILD_DATE ?= $(shell git log -1 --format=%cI 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
 export VCS_REF
 export BUILD_DATE
 
@@ -360,8 +365,10 @@ watch: ## Live build history across all snoc-* builders (WATCH_BUILDERS=, WATCH_
 			[ -n "$$out" ] || continue; \
 			echo "══ $$b"; \
 			echo "$$out"; \
-			if docker buildx history ls --builder $$b --filter status=running \
-					--format "{{.Ref}}" 2>/dev/null | grep -q .; then \
+			run=$$(timeout 8 docker buildx history ls --builder $$b \
+				--filter status=running --format "{{.Ref}}" 2>/dev/null); \
+			if [ -n "$$run" ] || [ -s $(LOAD_CACHE).busy.$$b ]; then \
+				[ -n "$$run" ] && touch $(LOAD_CACHE).busy.$$b || rm -f $(LOAD_CACHE).busy.$$b; \
 				$(MAKE_BIN) --no-print-directory builder-load BUILDER=$$b; \
 			fi; \
 			echo; \
@@ -403,8 +410,9 @@ builder-restart: ## Restart buildkitd for $(BUILDER), clearing stuck builds
 
 # Per-node load. Kept as its own target so `watch` can re-enter make
 # rather than inlining a second layer of quoting inside its shell string.
+LOAD_CACHE := /tmp/.rocm-load
 builder-load: ## Show CPU, cores and load for each node of $(BUILDER)
-	@docker buildx inspect $(BUILDER) 2>/dev/null \
+	@timeout 10 docker buildx inspect $(BUILDER) 2>/dev/null \
 		| awk '/^Name:[[:space:]]+[^[:space:]]/ {n=$$2} /^Endpoint:/ {print n, $$2}' \
 		| while read node endpoint; do \
 			case "$$endpoint" in \
@@ -416,8 +424,15 @@ builder-load: ## Show CPU, cores and load for each node of $(BUILDER)
 			mem=$$(echo "$$stats" | sed -n 1p | cut -d'|' -f2); \
 			cores=$$(echo "$$stats" | sed -n 2p); \
 			load=$$(echo "$$stats" | sed -n 3p | sed 's/.*load average: //'); \
-			printf '   %-14s cpu=%-9s of %s cores   mem=%-22s load=%s\n' \
-				"$$node" "$${cpu:-?}" "$${cores:-?}" "$${mem:-?}" "$${load:-?}"; \
+			line=$$(printf '   %-14s cpu=%-9s of %s cores   mem=%-22s load=%s' \
+				"$$node" "$$cpu" "$$cores" "$$mem" "$$load"); \
+			if [ -n "$$cpu" ] && [ -n "$$cores" ]; then \
+				echo "$$line" | tee "$(LOAD_CACHE).$$node" ; \
+			elif [ -s "$(LOAD_CACHE).$$node" ]; then \
+				printf '%s  (stale)\n' "$$(cat $(LOAD_CACHE).$$node)"; \
+			else \
+				printf '   %-14s (load unavailable)\n' "$$node"; \
+			fi; \
 		done
 
 build-status: ## List build records for $(BUILDER)
