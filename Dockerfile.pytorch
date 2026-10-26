@@ -3,14 +3,14 @@
 # Builds PyTorch with HIP support optimized for RDNA3/4 architecture
 # Requires PyTorch 2.14.0+ and ROCm 10.1+
 
-ARG BASE_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/base:10.1.0-full-3.12
+ARG BASE_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/base:10.1.0-full-3.14
 FROM ${BASE_IMAGE} AS builder
 
-LABEL org.opencontainers.image.source="https://github.com/your-org/rocm-pytorch-build"
-LABEL org.opencontainers.image.description="PyTorch ${PYTORCH_VERSION} ROCm ${ROCM_VERSION} gfx950 build"
-
 # ─── PyTorch source checkout ─────────────────────────────────────
-ARG PYTORCH_VERSION=2.14.0
+# These precede the LABELs below on purpose: an ARG referenced before it
+# is declared expands to the empty string, and the label silently loses
+# the version it is meant to record.
+ARG PYTORCH_VERSION=2.14.1
 ARG ROCM_VERSION=10.1.0-full
 ARG USE_AITER=ON
 ARG USE_FLYDSL=ON
@@ -19,13 +19,21 @@ ARG GIT_REF=""
 # Declared or the ENV references below expand to empty and the build
 # silently targets no GPU architecture at all.
 ARG PYTORCH_ROCM_ARCH=gfx950
-ARG PYTHON_VERSION=3.12
+ARG PYTHON_VERSION=3.14
 
-RUN git clone --depth 1 --branch v${PYTORCH_VERSION} \
+LABEL org.opencontainers.image.source="https://github.com/sbates130272/rocm-pytorch-build"
+LABEL org.opencontainers.image.description="PyTorch ${PYTORCH_VERSION} ROCm ${ROCM_VERSION} ${PYTORCH_ROCM_ARCH} build"
+
+# --recurse-submodules is not optional: PyTorch builds from third_party
+# submodules, and a plain clone produces empty directories and a cmake
+# failure a long way into the build.
+RUN git clone --depth 1 --branch v${PYTORCH_VERSION} --recurse-submodules \
+    --shallow-submodules \
     https://github.com/pytorch/pytorch.git /opt/pytorch \
     && cd /opt/pytorch \
     && if [ -n "${GIT_REF}" ]; then \
-       git fetch origin ${GIT_REF} && git checkout ${GIT_REF}; \
+       git fetch origin ${GIT_REF} && git checkout ${GIT_REF} \
+       && git submodule sync && git submodule update --init --recursive; \
     fi
 
 WORKDIR /opt/pytorch
@@ -94,28 +102,53 @@ ENV USE_AITER=${USE_AITER} \
     USE_FLYDSL=${USE_FLYDSL} \
     USE_FLASH_ATTENTION=${USE_FLASH_ATTENTION}
 
-ENV USE_ROCM=ON \
-    USE_CUDA=OFF \
-    CMAKE_CUDA_ARCHITECTURES="ROCM" \
+# CMAKE_CUDA_ARCHITECTURES="ROCM" and CMAKE_CXX_FLAGS="-march=gfx950"
+# are both gone. -march/-mtune are host-CPU flags: gfx950 is a GPU
+# target, so every host compile would have failed on an unrecognised
+# -march value. The GPU architecture is selected by PYTORCH_ROCM_ARCH
+# alone, which upstream documents as the supported mechanism.
+# PyTorch pulls cmake 4.x from pip, which dropped compatibility with
+# cmake_minimum_required(<3.5). Several vendored deps (confu/NNPACK and
+# friends) still declare it, and fail to configure without this.
+ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
+
+ENV USE_ROCM=1 \
+    USE_CUDA=0 \
     USE_MKLDNN=OFF \
     USE_NCCL=OFF \
     USE_KINETO=OFF \
     USE_FBGEMM=ON \
     USE_QNNPACK=ON \
-    USE_PYTHREAD=ON \
     BUILD_TEST=OFF \
     BUILD_BINARY=OFF \
     BUILD_SHARED_LIBS=ON \
-    CMAKE_BUILD_TYPE=Release \
-    CMAKE_CXX_FLAGS="-march=gfx950 -mtune=gfx950"
+    CMAKE_BUILD_TYPE=Release
 
 # ROCm specific build flags
 # HIP_ARCHITECTURES set via PYTORCH_ROCM_ARCH (default gfx950, override with semicolon-separated list)
 # Example: PYTORCH_ROCM_ARCH="gfx90a;gfx942;gfx1100"
-ENV ROCM_HOME=/opt/rocm \
-    HIP_ARCHITECTURES=${PYTORCH_ROCM_ARCH} \
+# ROCM_PATH is what the build system reads (ROCM_HOME is kept as the
+# older alias). PYTORCH_ROCM_ARCH is the documented way to pin the GPU
+# target; the build detects it automatically when unset.
+ENV ROCM_PATH=/opt/rocm \
+    ROCM_HOME=/opt/rocm \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
     USE_SYSTEM_NCCL=OFF \
-    CMAKE_HIP_FLAGS="-DGPU_ARCHS=${PYTORCH_ROCM_ARCH}"
+    CMAKE_PREFIX_PATH=/opt/venv
+
+# ─── Build requirements ──────────────────────────────────────────
+# Upstream's documented dependency install for 2.14 is the PEP 735 dev
+# group, not requirements.txt. --no-isolation means pip will not fetch
+# the build backend itself, so it has to be here too.
+RUN pip install --no-cache-dir build && \
+    pip install --no-cache-dir --group dev && \
+    pip install --no-cache-dir mkl-static mkl-include
+
+# ─── Hipify for ROCm ─────────────────────────────────────────────
+# Upstream: "If you're compiling for AMD ROCm then first run this
+# command". It rewrites CUDA sources to HIP in place; without it the
+# build compiles the CUDA paths and fails.
+RUN python tools/amd_build/build_amd.py
 
 # ─── Build PyTorch ───────────────────────────────────────────────
 # pipefail matters: without it the RUN takes tee's exit status, so a
@@ -123,8 +156,14 @@ ENV ROCM_HOME=/opt/rocm \
 # dist/ one step later.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN python setup.py bdist_wheel \
-    --dist-dir /opt/pytorch/dist \
+# PyTorch 2.14 dropped `setup.py bdist_wheel`: the build moved to
+# scikit-build-core behind the standard PEP 517 interface, and setup.py
+# now refuses every command except install/develop. --no-isolation keeps
+# the build in this environment so it sees ROCm, the pinned Python and
+# the sccache launchers; it means the build requirements have to be
+# present already, which the previous step installs.
+RUN python -m build --wheel --no-isolation \
+    --outdir /opt/pytorch/dist \
     2>&1 | tee /opt/pytorch/build.log \
     && sccache --show-stats | tee /opt/pytorch/sccache-stats.txt
 
@@ -154,8 +193,12 @@ else: \
 # ─── Final PyTorch image ─────────────────────────────────────────
 FROM ${BASE_IMAGE} AS final
 
-LABEL org.opencontainers.image.source="https://github.com/your-org/rocm-pytorch-build"
-LABEL org.opencontainers.image.description="Built PyTorch ${PYTORCH_VERSION} for gfx950"
+ARG PYTORCH_VERSION
+ARG ROCM_VERSION
+ARG PYTORCH_ROCM_ARCH
+
+LABEL org.opencontainers.image.source="https://github.com/sbates130272/rocm-pytorch-build"
+LABEL org.opencontainers.image.description="PyTorch ${PYTORCH_VERSION} for ${PYTORCH_ROCM_ARCH}, ROCm ${ROCM_VERSION}"
 
 # Build records, kept so timing and cache-hit data survive the build
 # stage being discarded. `make build-report` reads sccache-stats.txt.

@@ -2,7 +2,7 @@
 # Minimal PyTorch ROCm runtime image for gfx950
 # Receives pre-built PyTorch wheel from pytorch target context
 
-ARG PYTHON_VERSION=3.12
+ARG PYTHON_VERSION=3.14
 ARG ROCM_VERSION=10.1.0-full
 
 FROM rocm/rocm:rocm_ubuntu24.04_${ROCM_VERSION} AS base

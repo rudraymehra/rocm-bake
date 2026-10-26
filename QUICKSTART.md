@@ -69,6 +69,19 @@ Verify it landed:
 docker-credential-pass list
 ```
 
+Zot also needs a raised HTTP read timeout, or pushing the ROCm base
+fails: its largest layer is 8.67GB and cannot cross a 1Gb/s link within
+Zot's 60-second default. In `/etc/zot/config.json`:
+
+```json
+"http": {
+  "readTimeout": "30m",
+  "writeTimeout": "30m"
+}
+```
+
+followed by `sudo systemctl restart zot`. Check with `make zot-check`.
+
 One login on Strix is enough for the whole fleet. buildx sends registry
 auth from your local Docker config to the builder as a session
 attachment, so builds pushing from think or gaming use it too — those
@@ -163,6 +176,18 @@ make build-pytorch          # just PyTorch (~30-60 min cold)
 make build-all BUILDER=snoc-pool # fan targets across all three nodes
 ```
 
+To measure true build cost, `make cold-build` disables both caches —
+no layer reuse and no sccache hits, so every object really compiles:
+
+```bash
+make cold-build BUILDER=snoc-think
+make cold-build COLD_TARGET=pytorch-base
+```
+
+`--no-cache` on its own is not cold: sccache would still serve every
+object from the shared store and the build would finish in minutes
+while measuring nothing.
+
 Each `make build-*` runs through `telemetry/build.sh`, which records
 duration, layer-cache hit ratio and sccache counters, then exits with
 the build's own status. `TELEMETRY=0 make build-pytorch` skips it.
@@ -183,6 +208,28 @@ make push-all
 After a build, the metrics are in
 `/var/lib/node_exporter/textfile_collector/rocm_pytorch_build.prom`, or
 `telemetry/out/` when that directory is not writable.
+
+Watch a build from a second terminal — this covers every builder, with a
+live tail of each running build:
+
+```bash
+make watch
+make watch WATCH_BUILDERS=snoc-think WATCH_LINES=40
+```
+
+Or look at one thing at a time:
+
+```bash
+make build-status     # records on $(BUILDER): running, completed, errored
+make build-logs       # step output, BUILD=<id> for a specific record
+make build-inspect    # duration, steps, cached steps, VCS revision
+make builder-logs     # buildkitd's own log: registry, DNS, cache failures
+make builder-restart  # clear a wedged build on $(BUILDER)
+```
+
+`build-logs` is what the build's steps printed; `builder-logs` is the
+daemon underneath, which is where a registry or DNS fault shows up while
+the build itself merely looks slow.
 
 ## Step 6 — Verify the build
 

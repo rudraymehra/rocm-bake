@@ -7,8 +7,8 @@
 REGISTRY ?= snoc-strix.fold-leaffish.ts.net:8080
 REGISTRY_NAME ?= rocm-pytorch
 PYTORCH_VERSION ?= 2.14.1
-ROCm_VERSION ?= 10.1.0-full
-PYTHON_VERSION ?= 3.12
+ROCM_VERSION ?= 10.1.0-full
+PYTHON_VERSION ?= 3.14
 BUILDER ?= snoc-strix
 REPO ?= $(REGISTRY_NAME)/base
 
@@ -23,6 +23,14 @@ GAMING_HOST ?= snoc-gaming
 # Every build goes through the telemetry wrapper: it runs the bake, then
 # records duration, layer-cache hit ratio and sccache counters, and exits
 # with the bake's own status. TELEMETRY=0 for a bare bake.
+# Provenance for the image tags and OCI labels. VCS_REF gets a -dirty
+# suffix when the tree has uncommitted changes, so an image built from
+# edited sources can never be mistaken for the commit it came from.
+VCS_REF ?= $(shell git rev-parse --short HEAD 2>/dev/null)$(shell git diff --quiet 2>/dev/null || echo -dirty)
+BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+export VCS_REF
+export BUILD_DATE
+
 TELEMETRY ?= 1
 ifeq ($(TELEMETRY),0)
 BAKE = docker buildx bake -f bake.hcl
@@ -32,7 +40,9 @@ endif
 
 .PHONY: help zot-check zot-catalog zot-tags zot-logs \
         builder-setup builder-snoc-strix builder-snoc-think builder-snoc-gaming \
-        builder-snoc-pool builder-status builder-ensure \
+        builder-snoc-pool builder-status builder-logs builder-restart \
+        build-status build-logs build-inspect builder-ensure watch \
+        cold-build build-aiter push-aiter aiter-wheel \
         build-base build-pytorch build-runtime build-all \
         push-base push-pytorch push-runtime push-all \
         clean clean-cache test \
@@ -155,9 +165,105 @@ builder-snoc-pool: ## Setup a 3-node pool (snoc-strix + snoc-think + snoc-gaming
 builder-status: ## Show all builders and their nodes
 	@docker buildx ls
 
+# The buildkitd *daemon* log, which is a different thing from a build
+# log: scheduling, cache GC, registry auth and connection failures. Use
+# `make watch` or `docker buildx history logs` for the steps of a build.
+# The container lives on whichever node the endpoint points at, so a
+# remote node's log has to be fetched over SSH.
+builder-logs: ## Tail buildkitd's own log for each node of $(BUILDER)
+	@docker buildx inspect $(BUILDER) 2>/dev/null \
+		| awk '/^Name:[[:space:]]+[^[:space:]]/ {n=$$2} /^Endpoint:/ {print n, $$2}' \
+		| while read node endpoint; do \
+			echo "══ $$node ($$endpoint)"; \
+			case "$$endpoint" in \
+				ssh://*) ssh "$${endpoint#ssh://}" \
+					"docker logs --tail $(WATCH_LINES) buildx_buildkit_$$node 2>&1" ;; \
+				*) docker logs --tail $(WATCH_LINES) "buildx_buildkit_$$node" 2>&1 ;; \
+			esac; \
+		done
+
+# `history logs` streams and never returns while a build is in flight, so
+# it is bounded by timeout(1). Killing the stream makes the client print
+# "rpc error: code = Canceled", once per refresh, which reads like a
+# build failure and is not one — hence the grep. Buffer through a file
+# rather than piping
+# straight to tail: when timeout kills docker mid-pipe the buffered
+# output is lost and the shell prints "Terminated" into the display.
+WATCH_INTERVAL ?= 5
+WATCH_LINES ?= 20
+WATCH_TMP := /tmp/.rocm-build-watch.log
+# Every snoc-* builder, so a build started on any node shows up. The pool
+# keeps its own buildkit instances separate from the single-node
+# builders, so it has its own history and is listed in its own right.
+# Override to narrow: make watch WATCH_BUILDERS=snoc-think
+# Parse the table, not --format '{{.Name}}': that prints node names too,
+# so the pool's nodes come back as duplicate builder names.
+WATCH_BUILDERS ?= $(shell docker buildx ls 2>/dev/null | awk 'NR>1 && /^[^ ]/ {gsub(/\*$$/,"",$$1); print $$1}' | grep -E '^snoc-' | tr '\n' ' ')
+
+watch: ## Live build history across all snoc-* builders (WATCH_BUILDERS=, WATCH_LINES=)
+	@command -v watch > /dev/null || { echo "watch(1) not found: apt-get install procps"; exit 1; }
+	@watch -n $(WATCH_INTERVAL) -t --color ' \
+		for b in $(WATCH_BUILDERS); do \
+			out=$$(docker buildx history ls --builder $$b 2>/dev/null | tail -n +2); \
+			[ -n "$$out" ] || continue; \
+			echo "══ $$b"; \
+			echo "$$out"; \
+			for id in $$(docker buildx history ls --builder $$b \
+					--filter status=running --format "{{.Ref}}" 2>/dev/null); do \
+				echo; echo "──── $$b / $$id ────"; \
+				timeout 3 docker buildx history logs "$$id" --builder $$b \
+					> $(WATCH_TMP) 2>&1 || true; \
+				grep -v "^$$" $(WATCH_TMP) \
+					| grep -v "rpc error: code = Canceled" \
+					| tail -$(WATCH_LINES); \
+			done; \
+			echo; \
+		done'
+
+
+
 # Build targets depend on this, not on builder-snoc-strix: hardcoding one
 # builder as the prerequisite meant `make push-base BUILDER=snoc-think`
 # created snoc-strix and made it the default, then built somewhere else.
+# Restart buildkitd on each node of $(BUILDER). This is how you clear a
+# build that is wedged — a stuck upload, or one left retrying after an
+# infrastructure fault. It drops that node's in-memory build state; the
+# registry layer cache and the shared compiler cache are untouched.
+builder-restart: ## Restart buildkitd for $(BUILDER), clearing stuck builds
+	@docker buildx inspect $(BUILDER) 2>/dev/null \
+		| awk '/^Name:[[:space:]]+[^[:space:]]/ {n=$$2} /^Endpoint:/ {print n, $$2}' \
+		| while read node endpoint; do \
+			echo "restarting buildkitd on $$node ($$endpoint)"; \
+			case "$$endpoint" in \
+				ssh://*) ssh "$${endpoint#ssh://}" \
+					"docker restart buildx_buildkit_$$node" > /dev/null ;; \
+				*) docker restart "buildx_buildkit_$$node" > /dev/null ;; \
+			esac; \
+		done
+	@echo "done"
+
+build-status: ## List build records for $(BUILDER)
+	@docker buildx history ls --builder $(BUILDER)
+
+# The steps of a build, as opposed to builder-logs which is the daemon.
+# Defaults to the most recent record; pass BUILD=<id> for a specific one.
+BUILD ?=
+build-logs: ## Show build-step logs (BUILD=<id>, default: most recent)
+	@id="$(BUILD)"; \
+	[ -n "$$id" ] || id=$$(docker buildx history ls --builder $(BUILDER) \
+		--format "{{.Ref}}" 2>/dev/null | head -1); \
+	[ -n "$$id" ] || { echo "No build records on $(BUILDER)"; exit 1; }; \
+	echo "══ $$id"; \
+	timeout 10 docker buildx history logs "$$id" --builder $(BUILDER) 2>&1 \
+		| grep -v "rpc error: code = Canceled" || true
+
+build-inspect: ## Duration, steps and cache stats (BUILD=<id>, default: most recent)
+	@id="$(BUILD)"; \
+	[ -n "$$id" ] || id=$$(docker buildx history ls --builder $(BUILDER) \
+		--format "{{.Ref}}" 2>/dev/null | head -1); \
+	[ -n "$$id" ] || { echo "No build records on $(BUILDER)"; exit 1; }; \
+	docker buildx history inspect "$$id" --builder $(BUILDER)
+
 builder-ensure:
 	@docker buildx inspect $(BUILDER) > /dev/null 2>&1 || { \
 		echo "Builder '$(BUILDER)' does not exist. Create it with:"; \
@@ -166,110 +272,80 @@ builder-ensure:
 	}
 
 # ─── Build Targets ───────────────────────────────────────────────
+# One canned recipe for every bake invocation. This used to be nine
+# copy-pasted blocks, and they had drifted: each push-* target ran the
+# build with no --push, then a SECOND bake with --push but no target
+# name — which builds and pushes the whole default group. `make
+# push-base` would have kicked off the full PyTorch build.
+#
+#   $(1) bake target ("" = the default group)
+#   $(2) extra flags (--push)
+define bake
+@$(BAKE) \
+	--builder $(BUILDER) \
+	--set "*.args.REGISTRY=$(REGISTRY)" \
+	--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
+	--set "*.args.PYTORCH_VERSION=$(PYTORCH_VERSION)" \
+	--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
+	--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
+	$(2) $(1)
+endef
+
 build-base: builder-ensure ## Build ROCm base image
-	@$(BAKE) \
-		--builder $(BUILDER) \
-		--set "*.args.REGISTRY=$(REGISTRY)" \
-		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
-		--set "*.args.PYTORCH_VERSION=$(PYTORCH_VERSION)" \
-		--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
-		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
-		pytorch-base
+	$(call bake,pytorch-base)
 
 build-pytorch: builder-ensure ## Build PyTorch (depends on base)
-	@$(BAKE) \
-		--builder $(BUILDER) \
-		--set "*.args.REGISTRY=$(REGISTRY)" \
-		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
-		--set "*.args.PYTORCH_VERSION=$(PYTORCH_VERSION)" \
-		--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
-		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
-		pytorch
+	$(call bake,pytorch)
 
 build-runtime: builder-ensure ## Build runtime image (depends on pytorch)
-	@$(BAKE) \
-		--builder $(BUILDER) \
-		--set "*.args.REGISTRY=$(REGISTRY)" \
-		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
-		--set "*.args.PYTORCH_VERSION=$(PYTORCH_VERSION)" \
-		--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
-		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
-		pytorch-run
+	$(call bake,pytorch-run)
 
 build-all: builder-ensure ## Build all targets
-	@$(BAKE) \
-		--builder $(BUILDER) \
-		--set "*.args.REGISTRY=$(REGISTRY)" \
-		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
-		--set "*.args.PYTORCH_VERSION=$(PYTORCH_VERSION)" \
-		--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
-		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)"
+	$(call bake,)
+
+# A genuinely cold build: no layer cache AND no compiler-cache hits.
+# --no-cache alone is not cold — sccache would still serve every object
+# from the shared store, and the build would finish in minutes while
+# measuring nothing. SCCACHE_RECACHE=true forces every compile to run and
+# repopulate. Use it to measure true build cost, not for routine builds.
+COLD_TARGET ?= pytorch
+
+cold-build: builder-ensure ## Fully cold build (no layer or compiler cache). COLD_TARGET=
+	@echo "Cold build of $(COLD_TARGET) on $(BUILDER): no layer cache, no sccache hits."
+	$(call bake,$(COLD_TARGET),--no-cache --set "*.args.SCCACHE_RECACHE=true")
 
 # ─── Push Targets ────────────────────────────────────────────────
+# --push replaces the image output, so these build and push in one pass
+# rather than building twice.
 push-base: builder-ensure ## Build and push base image
-	@$(BAKE) \
-		--builder $(BUILDER) \
-		--set "*.args.REGISTRY=$(REGISTRY)" \
-		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
-		--set "*.args.PYTORCH_VERSION=$(PYTORCH_VERSION)" \
-		--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
-		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
-		pytorch-base
-	@$(BAKE) \
-		--builder $(BUILDER) \
-		--set "*.args.REGISTRY=$(REGISTRY)" \
-		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
-		--push
+	$(call bake,pytorch-base,--push)
 
 push-pytorch: builder-ensure ## Build and push PyTorch
-	@$(BAKE) \
-		--builder $(BUILDER) \
-		--set "*.args.REGISTRY=$(REGISTRY)" \
-		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
-		--set "*.args.PYTORCH_VERSION=$(PYTORCH_VERSION)" \
-		--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
-		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
-		pytorch
-	@$(BAKE) \
-		--builder $(BUILDER) \
-		--set "*.args.REGISTRY=$(REGISTRY)" \
-		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
-		--push
+	$(call bake,pytorch,--push)
 
 push-runtime: builder-ensure ## Build and push runtime image
-	@$(BAKE) \
-		--builder $(BUILDER) \
-		--set "*.args.REGISTRY=$(REGISTRY)" \
-		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
-		--set "*.args.PYTORCH_VERSION=$(PYTORCH_VERSION)" \
-		--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
-		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
-		pytorch-run
-	@$(BAKE) \
-		--builder $(BUILDER) \
-		--set "*.args.REGISTRY=$(REGISTRY)" \
-		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
-		--push
+	$(call bake,pytorch-run,--push)
+
+build-aiter: builder-ensure ## Build the AITER wheel (needs pytorch pushed first)
+	$(call bake,aiter)
+
+push-aiter: builder-ensure ## Build and push the AITER wheel image
+	$(call bake,aiter,--push)
+
+# The wheel lives in an image; this is how you get it onto local disk.
+aiter-wheel: ## Extract the AITER wheel from the registry into ./dist
+	@mkdir -p dist
+	@docker buildx build --builder $(BUILDER) \
+		--output type=local,dest=dist \
+		- <<< "FROM $(REGISTRY)/$(REGISTRY_NAME)/aiter:latest"
+	@ls -la dist/wheels/
 
 push-all: builder-ensure ## Build and push all targets
-	@$(BAKE) \
-		--builder $(BUILDER) \
-		--set "*.args.REGISTRY=$(REGISTRY)" \
-		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
-		--set "*.args.PYTORCH_VERSION=$(PYTORCH_VERSION)" \
-		--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
-		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)"
+	$(call bake,,--push)
 
 # ─── Test ─────────────────────────────────────────────────────────
 test: builder-ensure ## Run test target
-	@$(BAKE) \
-		--builder $(BUILDER) \
-		--set "*.args.REGISTRY=$(REGISTRY)" \
-		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
-		--set "*.args.PYTORCH_VERSION=$(PYTORCH_VERSION)" \
-		--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
-		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
-		pytorch-test
+	$(call bake,pytorch-test)
 
 # ─── Utilities ────────────────────────────────────────────────────
 validate: ## Validate bake file

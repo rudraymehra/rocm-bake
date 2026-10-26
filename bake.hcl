@@ -56,12 +56,48 @@ variable "USE_FLASH_ATTENTION" {
   default = "ON"
 }
 
+# Ubuntu 26.04 ships only 3.14 — 3.12 and 3.13 are absent from the
+# archive, so an older pin cannot be apt-installed on this base.
 variable "PYTHON_VERSION" {
-  default = "3.12"
+  default = "3.14"
 }
 
 variable "GIT_REF" {
   default = ""
+}
+
+# Short commit of THIS repo, for an immutable tag alongside the moving
+# one. Two builds of the same PyTorch version from different repo states
+# otherwise produce identical tags and silently overwrite each other.
+# The Makefile passes it; empty means "no repo tag", not "unknown".
+variable "AITER_REF" {
+  default = "main"
+}
+
+variable "VCS_REF" {
+  default = ""
+}
+
+# RFC3339 build time for the OCI created label. Same source.
+variable "BUILD_DATE" {
+  default = ""
+}
+
+variable "SOURCE_URL" {
+  default = "https://github.com/sbates130272/rocm-pytorch-build"
+}
+
+# gfx950 used to be hardcoded into the tags, so a gfx942 build produced
+# an image tagged gfx950. Derive it instead: PYTORCH_ROCM_ARCH is a
+# semicolon-separated list, which is not legal in a tag.
+ARCH_TAG = replace(PYTORCH_ROCM_ARCH, ";", "_")
+
+# Shared OCI provenance. Without revision and created there is no way to
+# work back from a running container to the commit that built it.
+OCI_LABELS = {
+  "org.opencontainers.image.source"   = SOURCE_URL
+  "org.opencontainers.image.revision" = VCS_REF
+  "org.opencontainers.image.created"  = BUILD_DATE
 }
 
 # Shared compiler cache on Strix, reachable from every build node. The
@@ -99,41 +135,59 @@ group "all" {
 
 # Shared cache config for all targets
 attrs = {
-  "cache-from" = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/cache:main,mode=max"],
-  "cache-to"   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/cache:main,mode=max,image-manifest=true,oci-mediatypes=true"],
+  "cache-from" = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/cache:main,mode=max,registry.insecure=true"],
+  "cache-to"   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/cache:main,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"],
 }
 
 # ─── Base ROCm image with dev toolchain ──────────────────────────
 target "pytorch-base" {
   dockerfile = "Dockerfile.base"
-  tags       = ["${REGISTRY}/${REGISTRY_NAME}/base:${ROCM_VERSION}-${PYTHON_VERSION}"]
+  tags = compact([
+    "${REGISTRY}/${REGISTRY_NAME}/base:${ROCM_VERSION}-${PYTHON_VERSION}",
+    "${REGISTRY}/${REGISTRY_NAME}/base:latest",
+    VCS_REF != "" ? "${REGISTRY}/${REGISTRY_NAME}/base:${ROCM_VERSION}-${PYTHON_VERSION}-g${VCS_REF}" : "",
+  ])
+  labels = merge(OCI_LABELS, {
+    "org.opencontainers.image.title"       = "rocm-pytorch base"
+    "org.opencontainers.image.description" = "ROCm ${ROCM_VERSION} dev base with Python ${PYTHON_VERSION}"
+    "org.opencontainers.image.version"     = "${ROCM_VERSION}-${PYTHON_VERSION}"
+  })
   platforms  = ["linux/amd64"]
 
   # Cache for base layer (apt + common deps)
-  cache-from = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/base-cache:latest,mode=max"]
-  cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/base-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true"]
+  cache-from = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/base-cache:latest,mode=max,registry.insecure=true"]
+  cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/base-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
 
   args = {
     ROCM_VERSION   = ROCM_VERSION
     PYTHON_VERSION = PYTHON_VERSION
   }
 
-  output = ["type=image", "compression=zstd"]
+  output = ["type=image,compression=zstd"]
 }
 
 # ─── Full PyTorch build ──────────────────────────────────────────
 target "pytorch" {
   inherits = ["pytorch-base"]
   dockerfile = "Dockerfile.pytorch"
-  tags       = ["${REGISTRY}/${REGISTRY_NAME}/pytorch:${PYTORCH_VERSION}-${ROCM_VERSION}-gfx950"]
+  tags = compact([
+    "${REGISTRY}/${REGISTRY_NAME}/pytorch:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}",
+    "${REGISTRY}/${REGISTRY_NAME}/pytorch:latest",
+    VCS_REF != "" ? "${REGISTRY}/${REGISTRY_NAME}/pytorch:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}-g${VCS_REF}" : "",
+  ])
+  labels = merge(OCI_LABELS, {
+    "org.opencontainers.image.title"       = "rocm-pytorch"
+    "org.opencontainers.image.description" = "PyTorch ${PYTORCH_VERSION} for ROCm ${ROCM_VERSION}, ${PYTORCH_ROCM_ARCH}"
+    "org.opencontainers.image.version"     = "${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}"
+  })
   platforms  = ["linux/amd64"]
 
   # Inherit base cache + pytorch-specific cache
   cache-from = [
-    "type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/pytorch-cache:latest,mode=max",
-    "type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/base-cache:latest,mode=max",
+    "type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/pytorch-cache:latest,mode=max,registry.insecure=true",
+    "type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/base-cache:latest,mode=max,registry.insecure=true",
   ]
-  cache-to = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/pytorch-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true"]
+  cache-to = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/pytorch-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
 
   args = {
     ROCM_VERSION         = ROCM_VERSION
@@ -156,21 +210,64 @@ target "pytorch" {
     REQUIRE_SCCACHE      = REQUIRE_SCCACHE
   }
 
-  output = ["type=image", "compression=zstd"]
+  output = ["type=image,compression=zstd"]
+}
+
+# ─── AITER wheel ─────────────────────────────────────────────────
+# Not part of the default group: it builds FROM the pytorch image, so it
+# only makes sense once that has been pushed. Build it explicitly, and
+# on whichever node is free — it is independent of the runtime image.
+target "aiter" {
+  dockerfile = "Dockerfile.aiter"
+  platforms  = ["linux/amd64"]
+
+  tags = compact([
+    "${REGISTRY}/${REGISTRY_NAME}/aiter:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}",
+    "${REGISTRY}/${REGISTRY_NAME}/aiter:latest",
+    VCS_REF != "" ? "${REGISTRY}/${REGISTRY_NAME}/aiter:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}-g${VCS_REF}" : "",
+  ])
+
+  labels = merge(OCI_LABELS, {
+    "org.opencontainers.image.title"       = "aiter wheel"
+    "org.opencontainers.image.description" = "AITER wheel built against PyTorch ${PYTORCH_VERSION}, ${PYTORCH_ROCM_ARCH}"
+    "org.opencontainers.image.version"     = "${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}"
+  })
+
+  cache-from = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/aiter-cache:latest,mode=max,registry.insecure=true"]
+  cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/aiter-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
+
+  args = {
+    PYTORCH_IMAGE       = "${REGISTRY}/${REGISTRY_NAME}/pytorch:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}"
+    AITER_REF           = AITER_REF
+    PYTORCH_ROCM_ARCH   = PYTORCH_ROCM_ARCH
+    SCCACHE_MEMCACHED   = SCCACHE_MEMCACHED
+    SCCACHE_SERVER_PORT = SCCACHE_SERVER_PORT
+  }
+
+  output = ["type=image,compression=zstd"]
 }
 
 # ─── Minimal runtime image ───────────────────────────────────────
 target "pytorch-run" {
   dockerfile = "Dockerfile.runtime"
-  tags       = ["${REGISTRY}/${REGISTRY_NAME}/runtime:${PYTORCH_VERSION}-${ROCM_VERSION}"]
+  tags = compact([
+    "${REGISTRY}/${REGISTRY_NAME}/runtime:${PYTORCH_VERSION}-${ROCM_VERSION}",
+    "${REGISTRY}/${REGISTRY_NAME}/runtime:latest",
+    VCS_REF != "" ? "${REGISTRY}/${REGISTRY_NAME}/runtime:${PYTORCH_VERSION}-${ROCM_VERSION}-g${VCS_REF}" : "",
+  ])
+  labels = merge(OCI_LABELS, {
+    "org.opencontainers.image.title"       = "rocm-pytorch runtime"
+    "org.opencontainers.image.description" = "Minimal PyTorch ${PYTORCH_VERSION} runtime for ROCm ${ROCM_VERSION}"
+    "org.opencontainers.image.version"     = "${PYTORCH_VERSION}-${ROCM_VERSION}"
+  })
   platforms  = ["linux/amd64"]
 
   # Inherit pytorch build cache
   cache-from = [
-    "type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/runtime-cache:latest,mode=max",
-    "type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/pytorch-cache:latest,mode=max",
+    "type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/runtime-cache:latest,mode=max,registry.insecure=true",
+    "type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/pytorch-cache:latest,mode=max,registry.insecure=true",
   ]
-  cache-to = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/runtime-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true"]
+  cache-to = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/runtime-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
 
   args = {
     PYTHON_VERSION = PYTHON_VERSION
@@ -180,13 +277,13 @@ target "pytorch-run" {
     pytorch = "${REGISTRY}/${REGISTRY_NAME}/pytorch:${PYTORCH_VERSION}-${ROCM_VERSION}-gfx950"
   }
 
-  output = ["type=image", "compression=zstd"]
+  output = ["type=image,compression=zstd"]
 }
 
 # ─── Build + Test target ─────────────────────────────────────────
 target "pytorch-test" {
   inherits = ["pytorch"]
-  tags     = ["${REGISTRY}/${REGISTRY_NAME}/pytorch:${PYTORCH_VERSION}-${ROCM_VERSION}-gfx950-test"]
+  tags     = ["${REGISTRY}/${REGISTRY_NAME}/pytorch:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}-test"]
 
   # Run the test stage in Dockerfile.pytorch
   run-target = "test"

@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1
+# AITER (github.com/ROCm/aiter) built as a standalone wheel.
+#
+# AITER is NOT built by PyTorch. The pytorch tree carries a
+# third_party/aiter submodule, but nothing in the PyTorch build reads
+# USE_AITER — it is a separate package with its own setup.py.
+#
+# It does need torch at build time: its setup.py imports torch, and its
+# own requirements note that "torch and triton are provided by the base
+# image as ROCm-specific builds ... not published on PyPI". So this
+# builds FROM our PyTorch image rather than from the ROCm base, which
+# means it runs after the pytorch target rather than alongside it. It is
+# still independent of the runtime image, so it can run on a different
+# node concurrently with other post-PyTorch work.
+#
+# The result is a thin image whose only payload is /wheels/*.whl. That
+# is how the wheel gets into Zot: an OCI image is something buildx can
+# push and `contexts` can consume, with no extra tooling (ORAS, a PyPI
+# index) and no second artifact store to keep alive.
+
+ARG PYTORCH_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/pytorch:latest
+FROM ${PYTORCH_IMAGE} AS builder
+
+ARG AITER_REF=main
+ARG PYTORCH_ROCM_ARCH=gfx950
+ARG SCCACHE_MEMCACHED=tcp://snoc-strix.fold-leaffish.ts.net:11211
+ARG SCCACHE_SERVER_PORT=4250
+
+LABEL org.opencontainers.image.source="https://github.com/ROCm/aiter"
+LABEL org.opencontainers.image.description="AITER wheel for ${PYTORCH_ROCM_ARCH}"
+
+ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+    GPU_ARCHS=${PYTORCH_ROCM_ARCH} \
+    ROCM_PATH=/opt/rocm \
+    SCCACHE_MEMCACHED=${SCCACHE_MEMCACHED} \
+    SCCACHE_SERVER_PORT=${SCCACHE_SERVER_PORT} \
+    SCCACHE_IGNORE_CLIENT_VERSION=1 \
+    CMAKE_C_COMPILER_LAUNCHER=sccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=sccache \
+    CMAKE_HIP_COMPILER_LAUNCHER=sccache \
+    CMAKE_POLICY_VERSION_MINIMUM=3.5
+
+# AITER's extensions are HIP, so the submodules under 3rdparty are not
+# optional any more than PyTorch's are.
+RUN git clone --depth 1 --branch ${AITER_REF} --recurse-submodules \
+    --shallow-submodules \
+    https://github.com/ROCm/aiter.git /opt/aiter
+
+WORKDIR /opt/aiter
+
+# flydsl is declared in AITER's [build-system].requires, which is also
+# the whole story on "FlyDSL": it is a PyPI build dependency of AITER,
+# not a PyTorch build option.
+RUN pip install --no-cache-dir build && \
+    pip install --no-cache-dir -r requirements.txt
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN python -m build --wheel --no-isolation \
+    --outdir /wheels \
+    2>&1 | tee /wheels-build.log \
+    && sccache --show-stats | tee /wheels-sccache-stats.txt
+
+SHELL ["/bin/sh", "-c"]
+
+RUN ls -la /wheels/
+
+# ─── Wheel-only image ────────────────────────────────────────────
+# scratch, not the PyTorch image: this exists to be consumed by
+# `COPY --from=`, so it should carry the wheel and nothing else.
+FROM scratch AS final
+
+ARG PYTORCH_ROCM_ARCH
+LABEL org.opencontainers.image.source="https://github.com/ROCm/aiter"
+LABEL org.opencontainers.image.description="AITER wheel for ${PYTORCH_ROCM_ARCH}"
+
+COPY --from=builder /wheels/ /wheels/
+COPY --from=builder /wheels-build.log /wheels-sccache-stats.txt /
