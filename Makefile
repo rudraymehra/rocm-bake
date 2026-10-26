@@ -49,12 +49,19 @@ endif
         validate bake-plan setup
 
 help: ## Show this help
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@awk 'BEGIN {FS = ":.*?## "} \
+		/^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5); next } \
+		/^[a-zA-Z_-]+:.*?## / { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }' \
+		$(MAKEFILE_LIST)
+	@printf '\nCommon variables: BUILDER (default %s), REGISTRY, PYTORCH_VERSION,\n' "$(BUILDER)"
+	@printf 'ROCM_VERSION, PYTHON_VERSION, TELEMETRY=0 to skip metrics.\n'
 
 # ─── Zot Registry ────────────────────────────────────────────────
 # zot runs as a bare-metal systemd service on Strix, deployed and owned
 # outside this repo. These targets inspect it; they never start or stop
 # it, because other services on the fleet pull through the same registry.
+##@ Registry (Zot)
+
 zot-check: ## Verify the Zot registry is reachable
 	@systemctl is-active --quiet zot \
 		&& echo "zot.service: active" \
@@ -77,6 +84,8 @@ zot-logs: ## Follow Zot registry logs
 	@sudo journalctl -u zot -f
 
 # ─── Buildx Builder Setup ────────────────────────────────────────
+##@ Builders
+
 builder-setup: builder-snoc-strix builder-snoc-think builder-snoc-gaming ## Setup all builders
 
 builder-snoc-strix: ## Setup the snoc-strix builder (local docker-container)
@@ -161,6 +170,8 @@ builder-snoc-pool: ## Setup a 3-node pool (snoc-strix + snoc-think + snoc-gaming
 			ssh://$(GAMING_HOST); \
 	fi
 	@docker buildx inspect snoc-pool --bootstrap
+
+##@ Monitoring
 
 builder-status: ## Show all builders and their nodes
 	@docker buildx ls
@@ -291,6 +302,8 @@ define bake
 	$(2) $(1)
 endef
 
+##@ Build
+
 build-base: builder-ensure ## Build ROCm base image
 	$(call bake,pytorch-base)
 
@@ -317,6 +330,8 @@ cold-build: builder-ensure ## Fully cold build (no layer or compiler cache). COL
 # ─── Push Targets ────────────────────────────────────────────────
 # --push replaces the image output, so these build and push in one pass
 # rather than building twice.
+##@ Push
+
 push-base: builder-ensure ## Build and push base image
 	$(call bake,pytorch-base,--push)
 
@@ -325,6 +340,11 @@ push-pytorch: builder-ensure ## Build and push PyTorch
 
 push-runtime: builder-ensure ## Build and push runtime image
 	$(call bake,pytorch-run,--push)
+
+push-all: builder-ensure ## Build and push all targets
+	$(call bake,,--push)
+
+##@ AITER
 
 build-aiter: builder-ensure ## Build the AITER wheel (needs pytorch pushed first)
 	$(call bake,aiter)
@@ -340,14 +360,15 @@ aiter-wheel: ## Extract the AITER wheel from the registry into ./dist
 		- <<< "FROM $(REGISTRY)/$(REGISTRY_NAME)/aiter:latest"
 	@ls -la dist/wheels/
 
-push-all: builder-ensure ## Build and push all targets
-	$(call bake,,--push)
-
 # ─── Test ─────────────────────────────────────────────────────────
+##@ Test
+
 test: builder-ensure ## Run test target
 	$(call bake,pytorch-test)
 
 # ─── Utilities ────────────────────────────────────────────────────
+##@ Utilities
+
 validate: ## Validate bake file
 	@docker buildx bake -f bake.hcl --print | jq empty && echo "Bake file is valid" || echo "Bake file has errors"
 
