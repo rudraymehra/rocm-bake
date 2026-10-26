@@ -84,6 +84,15 @@ RUN python -m build --wheel --no-isolation \
     2>&1 | tee /wheels-build.log \
     && sccache --show-stats | tee /wheels-sccache-stats.txt
 
+# triton-kernels as well. AITER's installer takes a local wheelhouse via
+# TRITON_WHEEL_DIR, but only if BOTH triton and triton-kernels are in it
+# — otherwise it returns 1 and falls back to AMD's public index, which
+# has nothing newer than ROCm 7.2. Shipping only triton would silently
+# give us the mismatched build we are trying to avoid.
+RUN cd python/triton_kernels && \
+    python -m build --wheel --no-isolation --outdir /wheels \
+    2>&1 | tee -a /wheels-build.log
+
 RUN ls -la /wheels/
 
 # ─── Wheel-only image ────────────────────────────────────────────

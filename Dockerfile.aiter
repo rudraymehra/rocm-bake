@@ -19,6 +19,11 @@
 # index) and no second artifact store to keep alive.
 
 ARG PYTORCH_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/pytorch:latest
+ARG TRITON_WHEEL_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/triton-wheel:latest
+
+# Our ROCm 10.1 triton, as a wheelhouse for AITER's installer.
+FROM ${TRITON_WHEEL_IMAGE} AS tritonwheels
+
 FROM ${PYTORCH_IMAGE} AS builder
 
 ARG AITER_REF=main
@@ -40,6 +45,18 @@ ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
     CMAKE_HIP_COMPILER_LAUNCHER=sccache \
     CMAKE_POLICY_VERSION_MINIMUM=3.5
 
+# sccache lives in Dockerfile.pytorch's *builder* stage and never
+# reaches `final`, which is what this image is FROM. Without it the
+# CMAKE_*_COMPILER_LAUNCHER settings above point at a missing binary and
+# the stats call at the end of the build step fails a build whose wheel
+# was produced successfully.
+ARG SCCACHE_VERSION=0.19.0
+RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    -o /tmp/sccache.tar.gz && \
+    tar xzf /tmp/sccache.tar.gz -C /usr/local/bin --strip-components=1 \
+        "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" && \
+    rm /tmp/sccache.tar.gz && chmod +x /usr/local/bin/sccache && sccache --version
+
 # AITER's extensions are HIP, so the submodules under 3rdparty are not
 # optional any more than PyTorch's are.
 RUN git clone --depth 1 --branch ${AITER_REF} --recurse-submodules \
@@ -47,6 +64,18 @@ RUN git clone --depth 1 --branch ${AITER_REF} --recurse-submodules \
     https://github.com/ROCm/aiter.git /opt/aiter
 
 WORKDIR /opt/aiter
+
+# AITER's setup.py runs .github/scripts/install_triton.sh, which
+# uninstalls whatever triton is present and installs one from AMD's
+# index. That index publishes nothing newer than ROCm 7.2, so against
+# our ROCm 10.1 torch it produces a three-major mismatch.
+#
+# The script checks TRITON_WHEEL_DIR first and only falls back to the
+# public index if that fails — but it needs BOTH triton and
+# triton-kernels present, hence Dockerfile.triton building both.
+COPY --from=tritonwheels /wheels/ /opt/triton-wheels/
+ENV TRITON_WHEEL_DIR=/opt/triton-wheels
+RUN ls -la /opt/triton-wheels/
 
 # --no-isolation means pip will NOT fetch the build backend's own
 # dependencies, so everything in [build-system].requires has to be
