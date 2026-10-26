@@ -1,10 +1,10 @@
 # Makefile - convenience wrapper for rocm-pytorch builds
 
-# Bare-metal zot on Strix (zot.service, /etc/zot/config.json). Tailnet IP
-# rather than the MagicDNS name on purpose: buildkit builder containers
-# get Docker's default resolver, not the tailnet one, so
-# snoc-strix.fold-leaffish.ts.net does not resolve inside a build.
-REGISTRY ?= 100.91.58.37:8080
+# Bare-metal zot on Strix (zot.service, /etc/zot/config.json). The
+# MagicDNS name only resolves inside a builder because every builder-*
+# target below passes --driver-opt network=host; see the comment in
+# .builders/buildkitd-strix.toml.
+REGISTRY ?= snoc-strix.fold-leaffish.ts.net:8080
 REGISTRY_NAME ?= rocm-pytorch
 PYTORCH_VERSION ?= 2.14.1
 ROCm_VERSION ?= 10.1.0-full
@@ -51,13 +51,14 @@ zot-logs: ## Follow Zot registry logs
 builder-setup: builder-strix builder-think builder-gaming ## Setup all builders
 
 builder-strix: ## Setup Strix builder (docker-container driver)
-	@if docker buildx ls | grep -q 'strix'; then \
+	@if docker buildx ls --format '{{.Name}}' | grep -qx 'strix'; then \
 		echo "Strix builder already exists"; \
 	else \
 		echo "Creating Strix builder..."; \
 		docker buildx create \
 			--name strix \
 			--driver docker-container \
+			--driver-opt network=host \
 			--config .builders/buildkitd-strix.toml \
 			--driver-opt env.BUILDKIT_STEP_LOG_MAX_SIZE=104857600 \
 			--driver-opt env.BUILDKIT_STEP_LOG_MAX_SPEED=10485760 \
@@ -79,6 +80,7 @@ builder-think: ## Setup Thinkstation builder (docker-container over SSH)
 		docker buildx create \
 			--name think \
 			--driver docker-container \
+			--driver-opt network=host \
 			--config .builders/buildkitd-strix.toml \
 			--driver-opt env.BUILDKIT_STEP_LOG_MAX_SIZE=104857600 \
 			--driver-opt env.BUILDKIT_STEP_LOG_MAX_SPEED=10485760 \
@@ -94,6 +96,7 @@ builder-gaming: ## Setup Gaming builder (docker-container over SSH)
 		docker buildx create \
 			--name gaming \
 			--driver docker-container \
+			--driver-opt network=host \
 			--config .builders/buildkitd-strix.toml \
 			--driver-opt env.BUILDKIT_STEP_LOG_MAX_SIZE=104857600 \
 			--driver-opt env.BUILDKIT_STEP_LOG_MAX_SPEED=10485760 \
@@ -112,15 +115,18 @@ builder-pool: ## Setup a 3-node pool (strix + think + gaming)
 		echo "Creating pool builder..."; \
 		docker buildx create --name pool --node pool-strix \
 			--driver docker-container \
+			--driver-opt network=host \
 			--config .builders/buildkitd-strix.toml \
 			--platform linux/amd64; \
 		docker buildx create --name pool --append --node pool-think \
 			--driver docker-container \
+			--driver-opt network=host \
 			--config .builders/buildkitd-strix.toml \
 			--platform linux/amd64 \
 			ssh://$(THINK_HOST); \
 		docker buildx create --name pool --append --node pool-gaming \
 			--driver docker-container \
+			--driver-opt network=host \
 			--config .builders/buildkitd-strix.toml \
 			--platform linux/amd64 \
 			ssh://$(GAMING_HOST); \

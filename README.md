@@ -20,7 +20,7 @@ Automated build pipeline for PyTorch with ROCm support optimized for AMD Strix H
 │  │  sccache server      │   │  cross-compile   │  │ cross-compile   │    │
 │  │  zot.service         │   │  only, no test   │  │ only, no test   │    │
 │  │                      │   │                  │  │                 │    │
-│  │  100.91.58.37        │   │  100.68.21.9     │  │ 100.70.171.36   │    │
+│  │  snoc-strix          │   │ snoc-thinkstation│  │  snoc-gaming    │    │
 │  └──────────┬───────────┘   └────────┬─────────┘  └────────┬────────┘    │
 │             │                        │                     │              │
 │             │          Tailscale Mesh (100.x.y.z)          │              │
@@ -29,7 +29,7 @@ Automated build pipeline for PyTorch with ROCm support optimized for AMD Strix H
 │             ▼                                                             │
 │  ┌──────────────────────────────────────────────────────────────┐         │
 │  │         Zot Registry (bare metal on Strix, zot.service)       │         │
-│  │         100.91.58.37:8080                  │         │
+│  │         snoc-strix.fold-leaffish.ts.net:8080                  │         │
 │  │                                                              │         │
 │  │  • Pull-through sync → Docker Hub, GHCR, Quay                │         │
 │  │  • BuildKit layer cache as OCI artifacts                      │         │
@@ -80,7 +80,7 @@ Automated build pipeline for PyTorch with ROCm support optimized for AMD Strix H
            │
            ▼
      Push to Zot
-     100.91.58.37:8080
+     snoc-strix.fold-leaffish.ts.net:8080
 ```
 
 ### Build Machine Roles
@@ -100,7 +100,7 @@ Automated build pipeline for PyTorch with ROCm support optimized for AMD Strix H
   certs, or the buildx plugin installed
 - Both gfx1201 (RDNA4) — they cross-compile for gfx950 fine, but cannot
   run `make test`
-- Reach Zot over the tailnet at `100.91.58.37:8080`
+- Reach Zot over the tailnet at `snoc-strix.fold-leaffish.ts.net:8080`
 - `make builder-pool` groups all three into one builder named `pool`,
   which fans build *targets* out across nodes (it does not split a single
   image across them)
@@ -145,7 +145,7 @@ Dockerfile.base          Dockerfile.pytorch        Dockerfile.runtime
 ```bash
 # Docker 27+ (no buildkitd, no TLS certs, no buildx plugin needed)
 # Reachable as `ssh snoc-thinkstation` / `ssh snoc-gaming` from Strix
-# Able to reach http://100.91.58.37:8080 over the tailnet
+# Able to reach http://snoc-strix.fold-leaffish.ts.net:8080 over the tailnet
 # Disk: 200GB+ for build cache
 ```
 
@@ -168,7 +168,7 @@ Reads are anonymous. Pushes need the `ci` account from
 `/etc/zot/htpasswd`:
 
 ```bash
-docker login 100.91.58.37:8080 -u ci
+docker login snoc-strix.fold-leaffish.ts.net:8080 -u ci
 ```
 
 It serves plain HTTP on the tailnet, so clients must trust it explicitly.
@@ -176,8 +176,8 @@ The Docker daemon reads `/etc/docker/daemon.json`:
 
 ```json
 {
-  "insecure-registries": ["100.91.58.37:8080"],
-  "registry-mirrors": ["http://100.91.58.37:8080"]
+  "insecure-registries": ["snoc-strix.fold-leaffish.ts.net:8080"],
+  "registry-mirrors": ["http://snoc-strix.fold-leaffish.ts.net:8080"]
 }
 ```
 
@@ -189,9 +189,10 @@ BuildKit does not inherit that — it reads
 
 On **SNOC Strix**:
 ```bash
-# Create docker-container driver builder. --config is required: without
-# it buildkit will not talk plain HTTP to Zot.
+# Both flags are required. --config so buildkit talks plain HTTP to Zot;
+# network=host so it can resolve the tailnet name in the first place.
 docker buildx create --name strix --driver docker-container \
+  --driver-opt network=host \
   --config .builders/buildkitd-strix.toml
 docker buildx use strix
 ```
@@ -261,7 +262,7 @@ docker buildx bake -f bake.hcl --builder strix pytorch
 ```bash
 # Run the built image with GPU access
 docker run --rm -it --device /dev/kfd --device /dev/dri \
-  100.91.58.37:8080/rocm-pytorch/pytorch:2.14.1-7.14-gfx950
+  snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/pytorch:2.14.1-7.14-gfx950
 ```
 
 Expected output:
@@ -423,9 +424,9 @@ docker buildx bake -f bake.hcl \
 
 Cache is stored in Zot at:
 
-- `100.91.58.37:8080/rocm-pytorch/base-cache` - Base image cache
-- `100.91.58.37:8080/rocm-pytorch/pytorch-cache` - PyTorch build cache
-- `100.91.58.37:8080/rocm-pytorch/runtime-cache` - Runtime cache
+- `snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/base-cache` - Base image cache
+- `snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/pytorch-cache` - PyTorch build cache
+- `snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/runtime-cache` - Runtime cache
 
 To use cache from another build:
 ```bash
@@ -490,15 +491,25 @@ systemctl status zot
 sudo journalctl -u zot -n 50
 
 # Verify registry API
-curl -s http://100.91.58.37:8080/v2/_catalog
+curl -s http://snoc-strix.fold-leaffish.ts.net:8080/v2/_catalog
 ```
 
-If the API answers but builds still fail on TLS, the client does not
-trust the plain-HTTP registry: check `insecure-registries` in
-`/etc/docker/daemon.json` for the Docker daemon, and confirm the builder
-was created with `--config .builders/buildkitd-strix.toml` for BuildKit
-(`docker buildx inspect strix`). If pushes get 401, `docker login
-100.91.58.37:8080 -u ci`.
+Two different failures look similar from a build log:
+
+- `no such host` — the builder cannot resolve the tailnet name. It was
+  created without `--driver-opt network=host`, so Docker gave it the
+  upstream resolver instead of the host's MagicDNS one.
+- `http: server gave HTTP response to HTTPS client` — DNS is fine but the
+  client will not speak plain HTTP. For the Docker daemon, check
+  `insecure-registries` in `/etc/docker/daemon.json`; for BuildKit,
+  confirm the builder was created with
+  `--config .builders/buildkitd-strix.toml`.
+
+Both settings are fixed at builder-create time, so the fix is always
+`docker buildx rm <name>` then `make builder-<name>`; editing the toml
+does nothing to an existing builder. Inspect with
+`docker buildx inspect <name>`. If pushes get 401, `docker login
+snoc-strix.fold-leaffish.ts.net:8080 -u ci`.
 
 ### Buildx builder not available
 

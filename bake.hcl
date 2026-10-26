@@ -21,10 +21,11 @@
 #   docker buildx bake -f bake.hcl --set 'target.pytorch.args.ROCM_VERSION=7.14'
 
 # Bare-metal zot on Strix (zot.service, /etc/zot/config.json), plain HTTP
-# on the tailnet. Tailnet IP rather than the MagicDNS name: builder
-# containers do not resolve snoc-strix.fold-leaffish.ts.net.
+# on the tailnet. Resolving this name inside a build requires the builder
+# to have been created with --driver-opt network=host, which the
+# Makefile's builder-* targets do.
 variable "REGISTRY" {
-  default = "100.91.58.37:8080"
+  default = "snoc-strix.fold-leaffish.ts.net:8080"
 }
 
 variable "REGISTRY_NAME" {

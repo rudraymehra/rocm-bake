@@ -40,7 +40,7 @@ make zot-check
 ```
 
 Expected: `zot.service: active` and `Zot registry is ready at
-100.91.58.37:8080`. To see what it holds:
+snoc-strix.fold-leaffish.ts.net:8080`. To see what it holds:
 
 ```bash
 make zot-catalog
@@ -50,7 +50,7 @@ Anonymous read is open; pushing needs the `ci` account from
 `/etc/zot/htpasswd`:
 
 ```bash
-docker login 100.91.58.37:8080 -u ci
+docker login snoc-strix.fold-leaffish.ts.net:8080 -u ci
 ```
 
 The registry serves plain HTTP over the tailnet, so the Docker daemon
@@ -58,8 +58,8 @@ needs it in `/etc/docker/daemon.json` (already set on Strix):
 
 ```json
 {
-  "insecure-registries": ["100.91.58.37:8080"],
-  "registry-mirrors": ["http://100.91.58.37:8080"]
+  "insecure-registries": ["snoc-strix.fold-leaffish.ts.net:8080"],
+  "registry-mirrors": ["http://snoc-strix.fold-leaffish.ts.net:8080"]
 }
 ```
 
@@ -71,11 +71,12 @@ make builder-strix
 
 The builder needs `.builders/buildkitd-strix.toml` to reach the registry
 over plain HTTP — `make builder-strix` passes it. Creating the builder by
-hand without `--config` gives TLS handshake failures on every pull and
-cache export:
+hand without both flags fails: `--config` for plain HTTP to Zot,
+`network=host` so the builder can resolve the tailnet name at all.
 
 ```bash
 docker buildx create --name strix --driver docker-container \
+  --driver-opt network=host \
   --config .builders/buildkitd-strix.toml
 docker buildx use strix
 ```
@@ -151,7 +152,7 @@ docker buildx bake -f bake.hcl --push
 
 ```bash
 docker run --rm -it --device /dev/kfd --device /dev/dri \
-  100.91.58.37:8080/rocm-pytorch/pytorch:2.14.1-10.1-gfx950
+  snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/pytorch:2.14.1-10.1-gfx950
 ```
 
 Then in the container:

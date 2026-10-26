@@ -2,9 +2,15 @@
 #
 # For the docker-container driver (what `make builder-strix` does):
 #   docker buildx create --name strix --driver docker-container \
-#     --config .builders/buildkitd-strix.toml
+#     --driver-opt network=host --config .builders/buildkitd-strix.toml
 # The config is baked in at create time — an existing builder does not
 # pick up edits to this file. Recreate it: docker buildx rm strix.
+#
+# network=host is not optional. Docker strips loopback nameservers when
+# it writes a container's resolv.conf, so a bridged builder falls back to
+# the upstream resolver and cannot resolve *.ts.net — the registry below
+# then fails with "no such host" mid-build. Sharing the host netns gives
+# the builder the host's resolver, MagicDNS included.
 #
 # For standalone buildkitd on Think:
 #   sudo cp buildkitd-strix.toml /etc/buildkit/buildkitd.toml
@@ -35,24 +41,25 @@
 # The bare-metal zot on Strix (zot.service, port 8080). It serves plain
 # HTTP on the tailnet, so buildkit needs http = true here or every pull
 # and every cache export fails on the TLS handshake.
-[registry."100.91.58.37:8080"]
+[registry."snoc-strix.fold-leaffish.ts.net:8080"]
   http = true
   insecure = true
 
 # zot syncs library/**, rocm/**, moby/** and friends on demand, so point
 # the upstreams at it rather than egressing for every layer.
 [registry."docker.io"]
-  mirrors = ["100.91.58.37:8080"]
+  mirrors = ["snoc-strix.fold-leaffish.ts.net:8080"]
 
 [registry."ghcr.io"]
-  mirrors = ["100.91.58.37:8080"]
+  mirrors = ["snoc-strix.fold-leaffish.ts.net:8080"]
 
 [registry."quay.io"]
-  mirrors = ["100.91.58.37:8080"]
+  mirrors = ["snoc-strix.fold-leaffish.ts.net:8080"]
 
-# Prometheus metrics + pprof
-[grpc]
-  debugAddress = "0.0.0.0:6060"
+# No [grpc] debugAddress here on purpose. With network=host a fixed debug
+# port is bound on the host, so a second builder on the same machine
+# (strix and pool-strix both live here) dies with "address already in
+# use". Set it per-builder with --driver-opt if you need the metrics.
 
 # Not expressible here, despite earlier attempts in this file:
 #   - Host mounts (/opt/rocm, /dev/kfd, /dev/dri, /var/cache/sccache).
