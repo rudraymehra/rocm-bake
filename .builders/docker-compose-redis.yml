@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: sccache-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - sccache-redis-data:/data
+    command: redis-server --maxmemory 4gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  sccache-redis-data:
+    driver: local

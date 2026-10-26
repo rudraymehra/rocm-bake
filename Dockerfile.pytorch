@@ -1,0 +1,140 @@
+# syntax=docker/dockerfile:1
+# PyTorch ROCm build from source targeting gfx950 (Strix Halo)
+# Builds PyTorch with HIP support optimized for RDNA3/4 architecture
+# Requires PyTorch 2.14.0+ and ROCm 10.1+
+
+ARG BASE_IMAGE=100.118.22.104:8080/rocm-pytorch/base:10.1.0-full-3.12
+FROM ${BASE_IMAGE} AS builder
+
+LABEL org.opencontainers.image.source="https://github.com/your-org/rocm-pytorch-build"
+LABEL org.opencontainers.image.description="PyTorch ${PYTORCH_VERSION} ROCm ${ROCM_VERSION} gfx950 build"
+
+# ─── PyTorch source checkout ─────────────────────────────────────
+ARG PYTORCH_VERSION=2.14.0
+ARG ROCM_VERSION=10.1.0-full
+ARG USE_AITER=ON
+ARG USE_FLYDSL=ON
+ARG USE_FLASH_ATTENTION=ON
+ARG GIT_REF=""
+
+RUN git clone --depth 1 --branch v${PYTORCH_VERSION} \
+    https://github.com/pytorch/pytorch.git /opt/pytorch \
+    && cd /opt/pytorch \
+    && if [ -n "${GIT_REF}" ]; then \
+       git fetch origin ${GIT_REF} && git checkout ${GIT_REF}; \
+    fi
+
+WORKDIR /opt/pytorch
+
+# ─── sccache compiler cache ──────────────────────────────────────
+# Install sccache binary (prebuilt from Mozilla releases)
+ARG SCCACHE_VERSION=0.7.7
+ARG TARGETARCH=amd64
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-${TARGETARCH}-unknown-linux-musl.tar.gz" \
+    -o /tmp/sccache.tar.gz && \
+    mkdir -p /usr/local/bin && \
+    tar xzf /tmp/sccache.tar.gz -C /usr/local/bin sccache && \
+    rm /tmp/sccache.tar.gz && \
+    chmod +x /usr/local/bin/sccache && \
+    sccache --version
+
+# Configure sccache for large HIP/C++ builds
+# 200GB cache to handle full PyTorch rebuilds
+ENV SCCACHE_DIR=/var/cache/sccache \
+    SCCACHE_CACHE_SIZE=200G \
+    SCCACHE_IGNORE_CLIENT_VERSION=1 \
+    SCCACHE_RECACHE=false
+
+# Create sccache cache directory with proper permissions
+RUN mkdir -p /var/cache/sccache && \
+    chmod 1777 /var/cache/sccache
+
+# ─── Build configuration ─────────────────────────────────────────
+# gfx950 is Strix Halo (RDNA 3.5 / CDNA 3 hybrid)
+# Build with: gfx900 gfx940 gfx941 gfx942 gfx950 gfx1030 gfx1100 gfx1101 gfx1102
+
+# Optional libraries — control via bake variables or build args
+ENV USE_AITER=${USE_AITER} \
+    USE_FLYDSL=${USE_FLYDSL} \
+    USE_FLASH_ATTENTION=${USE_FLASH_ATTENTION}
+
+ENV USE_ROCM=ON \
+    USE_CUDA=OFF \
+    CMAKE_CUDA_ARCHITECTURES="ROCM" \
+    USE_MKLDNN=OFF \
+    USE_NCCL=OFF \
+    USE_KINETO=OFF \
+    USE_FBGEMM=ON \
+    USE_QNNPACK=ON \
+    USE_PYTHREAD=ON \
+    BUILD_TEST=OFF \
+    BUILD_BINARY=OFF \
+    BUILD_SHARED_LIBS=ON \
+    CMAKE_BUILD_TYPE=Release \
+    CMAKE_CXX_FLAGS="-march=gfx950 -mtune=gfx950"
+
+# ROCm specific build flags
+# HIP_ARCHITECTURES set via PYTORCH_ROCM_ARCH (default gfx950, override with semicolon-separated list)
+# Example: PYTORCH_ROCM_ARCH="gfx90a;gfx942;gfx1100"
+ENV ROCM_HOME=/opt/rocm \
+    HIP_ARCHITECTURES=${PYTORCH_ROCM_ARCH} \
+    USE_SYSTEM_NCCL=OFF \
+    CMAKE_HIP_FLAGS="-DGPU_ARCHS=${PYTORCH_ROCM_ARCH}"
+
+# ─── Build PyTorch ───────────────────────────────────────────────
+RUN python setup.py bdist_wheel \
+    --dist-dir /opt/pytorch/dist \
+    2>&1 | tee /opt/pytorch/build.log
+
+# Verify the wheel was built
+RUN ls -la /opt/pytorch/dist/
+
+# ─── Test stage (optional, run with --target pytorch-test) ───────
+FROM builder AS test
+
+RUN python -c "\
+import torch; \
+print(f'PyTorch version: {torch.__version__}'); \
+print(f'HIP available: {torch.version.hip}'); \
+print(f'HIP runtime: {torch.cuda.is_available()}'); \
+if torch.cuda.is_available(): \
+    print(f'Device count: {torch.cuda.device_count()}'); \
+    for i in range(torch.cuda.device_count()): \
+        print(f'Device {i}: {torch.cuda.get_device_name(i)}'); \
+        print(f'  HIP Compute Unit: {torch.cuda.get_device_properties(i).total_memory / 1e9:.1f}GB'); \
+        print(f'  HIP Compute Capability: {torch.cuda.get_device_capability(i)}'); \
+else: \
+    print('ERROR: CUDA/HIP not available!'); \
+    exit(1)"
+
+# ─── Final PyTorch image ─────────────────────────────────────────
+FROM ${BASE_IMAGE} AS final
+
+LABEL org.opencontainers.image.source="https://github.com/your-org/rocm-pytorch-build"
+LABEL org.opencontainers.image.description="Built PyTorch ${PYTORCH_VERSION} for gfx950"
+
+# Install the built wheel
+COPY --from=builder /opt/pytorch/dist/*.whl /opt/pytorch/dist/*.whl
+
+RUN pip install --no-cache-dir /opt/pytorch/dist/*.whl \
+    && rm -rf /opt/pytorch/dist/*.whl \
+    && pip install --no-cache-dir \
+        torchaudio \
+        torchdata \
+        torchvision \
+        2>&1 | tee /opt/pytorch/install.log || true
+
+# Clean build artifacts
+RUN rm -rf /opt/pytorch
+
+# ROCm runtime config
+ENV ROCM_PATH=/opt/rocm
+ENV PATH=${ROCM_PATH}/bin:${ROCM_PATH}/hip/bin:${PATH}
+ENV LD_LIBRARY_PATH=${ROCM_PATH}/lib:/opt/rocm/lib:$LD_LIBRARY_PATH
+ENV HSA_OVERRIDE_GFX_VERSION=11.0.2
+
+# Test entrypoint
+CMD ["python", "-c", "import torch; print(f'PyTorch {torch.__version__} HIP:{torch.version.hip}'); print(f'Devices: {torch.cuda.device_count() if torch.cuda.is_available() else 0}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}'); import sys; sys.exit(0 if torch.cuda.is_available() else 1)"]
+
+ENTRYPOINT ["python"]

@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+*.whl
+*.log
+.cache/
+
+# Docker
+.DS_Store
+docker-compose.override.yml
+zot/data/
+zot/zot-credentials.json
+
+# Buildx builder cache
+.docker/
+
+# OS files
+*.swp
+*.swo
+*~
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.pyc

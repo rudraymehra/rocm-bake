@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  zot:
+    image: ghcr.io/project-zot/zot-linux-amd64:latest
+    container_name: zot-registry
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+      - "8081:8081"
+    volumes:
+      - ./zot/config.json:/etc/zot/config.json:ro
+      - zot-data:/var/lib/registry
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  zot-data:
+    driver: local

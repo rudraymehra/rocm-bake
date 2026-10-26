@@ -1,0 +1,84 @@
+name: Build & push — ROCm PyTorch
+
+on:
+  workflow_dispatch:
+    inputs:
+      rocm_version:
+        description: 'ROCm version (e.g. 7.14, 10.1)'
+        default: '7.14'
+        required: false
+      pytorch_version:
+        description: 'PyTorch version (e.g. 2.14.1)'
+        default: '2.14.1'
+        required: false
+      rocm_arch:
+        description: 'ROCm architecture (e.g. gfx950;gfx942;gfx90a)'
+        default: 'gfx950'
+        required: false
+      registry:
+        description: 'Registry URL'
+        default: 'localhost:5000'
+        required: false
+      push:
+        description: 'Push to registry'
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [pytorch-base, pytorch, pytorch-run, pytorch-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Registry
+        if: inputs.push == true
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASS }}
+
+      - name: Build ${{ matrix.target }}
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          PYTORCH_VERSION: ${{ inputs.pytorch_version }}
+          ROCM_VERSION: ${{ inputs.rocm_version }}
+          PYTORCH_ROCM_ARCH: ${{ inputs.rocm_arch }}
+        run: |
+          docker buildx bake \
+            -f bake.hcl \
+            --set "*.args.REGISTRY=${REGISTRY}" \
+            --set "target.pytorch.args.PYTORCH_VERSION=${PYTORCH_VERSION}" \
+            --set "target.pytorch.args.ROCM_VERSION=${ROCM_VERSION}" \
+            --set "target.pytorch.args.PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}" \
+            ${{ matrix.target }}
+
+      - name: Push ${{ matrix.target }}
+        if: inputs.push == true
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          PYTORCH_VERSION: ${{ inputs.pytorch_version }}
+          ROCM_VERSION: ${{ inputs.rocm_version }}
+          PYTORCH_ROCM_ARCH: ${{ inputs.rocm_arch }}
+        run: |
+          docker buildx bake \
+            -f bake.hcl \
+            --push \
+            --set "*.args.REGISTRY=${REGISTRY}" \
+            --set "target.pytorch.args.PYTORCH_VERSION=${PYTORCH_VERSION}" \
+            --set "target.pytorch.args.ROCM_VERSION=${ROCM_VERSION}" \
+            --set "target.pytorch.args.PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}" \
+            ${{ matrix.target }}

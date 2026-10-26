@@ -1,0 +1,73 @@
+# Buildkit daemon configuration for SNOC Strix (gfx950, ROCm)
+# Install: sudo cp buildkitd.toml /etc/buildkitd/buildkitd.toml
+#          sudo systemctl restart docker (docker-container driver)
+#          or: sudo systemctl restart buildkitd (standalone mode)
+#
+# For docker-container driver on Strix:
+#   docker buildx create --name strix --driver docker-container
+#
+# For standalone mode on Think:
+#   sudo cp buildkitd.toml /etc/buildkitd/buildkitd.toml
+#   sudo systemctl enable --now buildkitd
+
+[worker.oci]
+  enabled = true
+  # Limit memory to avoid OOM on 64GB shared-memory Strix Halo
+  # Leaving ~16GB for the host + display
+  "netns.mode" = "separate"
+
+  # Resource limits for ROCm worker
+  "limits.memory" = "48g"
+  "limits.cpu" = "10"
+
+  # Mount the host's ROCm runtime AND sccache cache directory
+  mount = [
+    "/opt/rocm:/opt/rocm",
+    "/dev/kfd:/dev/kfd",
+    "/dev/dri:/dev/dri",
+    "/var/cache/sccache:/var/cache/sccache",
+  ]
+
+  # Enable security capabilities
+  "annotations.buildkit/oci/runtime" = "io.containerd.runc.v2"
+
+[worker.oci.labels]
+  "com.snoc.platform" = "strix-halo"
+  "com.snoc.gpu" = "gfx950"
+
+[worker.containerd]
+  enabled = true
+  namespace = "buildkit"
+  # Limit memory similarly
+  "limits.memory" = "48g"
+  "limits.cpu" = "10"
+  # ROCm mounts for containerd worker
+  mount = [
+    "/opt/rocm:/opt/rocm",
+    "/dev/kfd:/dev/kfd",
+    "/dev/dri:/dev/dri",
+    "/var/cache/sccache:/var/cache/sccache",
+  ]
+
+  # Socket path (docker-container driver uses this)
+  "address" = "/run/buildkit/buildkitd.sock"
+
+[registry."docker.io"]
+  # Pull-through cache upstream for Docker Hub
+  mirrors = ["mirror.gcr.io"]
+  http = true
+  insecure = false
+
+[registry."ghcr.io"]
+  mirrors = []
+  http = true
+  insecure = false
+
+[registry."nvcr.io"]
+  mirrors = []
+  http = true
+  insecure = false
+
+[metrics]
+  enabled = true
+  address = ":9999"

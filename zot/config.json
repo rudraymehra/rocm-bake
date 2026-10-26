@@ -1,0 +1,86 @@
+{
+  "distSpec": "1.0.1",
+  "storage": {
+    "rootDirectory": "/var/lib/registry",
+    "delete": {
+      "enabled": true
+    },
+    "reflection": {
+      "upstreams": {
+        "repositoryMap": {
+          "*": {
+            "upstreamURL": "https://mirror.gcr.io"
+          }
+        }
+      }
+    }
+  },
+  "http": {
+    "addr": "0.0.0.0:5000",
+    "port": "5000",
+    "relativeurls": false,
+    "tls": {
+      "certificate": "",
+      "key": ""
+    },
+    "debug": {
+      "addr": ":8081",
+      "prometheus": {
+        "enabled": true,
+        "path": "/metrics"
+      }
+    }
+  },
+  "loglevel": "info",
+  "logFormat": "text",
+  "metadata": {
+    "maxThreads": 100,
+    "delayFunction": {
+      "default": {
+        "type": "simple",
+        "config": {
+          "intervalHours": 0.0,
+          "delaySeconds": 10
+        }
+      }
+    }
+  },
+  "extensions": {
+    "health": {
+      "storage": {
+        "interval": 10,
+        "hook": {
+          "type": "sh",
+          "config": {
+            "cmd": "/usr/local/bin/healthcheck.sh"
+          }
+        }
+      },
+      "imagestore": {
+        "interval": 10,
+        "hook": {
+          "type": "sh",
+          "config": {
+            "cmd": "/usr/local/bin/healthcheck.sh"
+          }
+        }
+      }
+    },
+    "sync": {
+      "registries": [
+        {
+          "urls": ["https://registry-1.docker.io"],
+          "onDemand": true
+        },
+        {
+          "urls": ["https://ghcr.io"],
+          "onDemand": true
+        },
+        {
+          "urls": ["https://nvcr.io"],
+          "onDemand": true
+        }
+      ]
+    }
+  }
+}

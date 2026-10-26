@@ -1,0 +1,44 @@
+# sccache server configuration for SNOC Strix Think build nodes
+# Deploy: sudo cp sccache.service /etc/systemd/system/
+#         sudo systemctl enable --now sccache
+#         sudo systemctl start sccache
+#
+# Verify: sccache --show-stats
+# Clear: sccache --stop-server && sccache --start-server
+#
+# Storage: 200GB SSD recommended
+# Port: 9000
+
+[Unit]
+Description=sccache compiler cache server for ROCm/PyTorch builds
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=root
+Group=root
+
+# Start the server
+ExecStartPre=-/usr/local/bin/sccache --stop-server
+ExecStart=/usr/local/bin/sccache --start-server \
+    --cache-size=200G \
+    --log-file /var/log/sccache/sccache.log
+
+# Restart on failure
+Restart=on-failure
+RestartSec=5
+
+# Resource limits
+MemoryMax=4G
+CPUQuota=200%
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/cache/sccache /var/log/sccache /tmp
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
