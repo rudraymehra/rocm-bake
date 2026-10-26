@@ -53,7 +53,7 @@ endif
         builder-snoc-pool builder-status builder-logs builder-restart \
         build-status build-logs build-inspect builder-ensure watch \
         cold-build build-aiter push-aiter aiter-wheel \
-        cache-stats cache-check cache-logs builder-load \
+        cache-stats cache-summary cache-check cache-logs builder-load \
         build-base build-pytorch build-runtime build-all \
         push-base push-pytorch push-runtime push-all \
         clean clean-cache test \
@@ -114,9 +114,53 @@ cache-stats: ## Show the shared compiler-cache (memcached) state
 		|| { echo "No memcached at $(MEMCACHED_HOST):$(MEMCACHED_PORT)"; exit 1; }
 	@printf 'stats\r\nquit\r\n' | timeout 5 nc $(MEMCACHED_HOST) $(MEMCACHED_PORT) 2>/dev/null \
 		| awk -F'[ \r]' '/^STAT get_hits/{h=$$3} /^STAT get_misses/{m=$$3} \
+			/^STAT cmd_get/{g=$$3} /^STAT cmd_set/{w=$$3} \
 			/^STAT bytes /{b=$$3} /^STAT limit_maxbytes/{l=$$3} \
-			END { if (h+m > 0) printf "  hit_rate            %.1f%%\n", 100*h/(h+m); \
-			      if (l > 0) printf "  ram_tier_used       %.1f%% of %.0fGB\n", 100*b/l, l/1073741824 }'
+			END { \
+			  if (l > 0) printf "  ram_tier_used       %.1f%% of %.0fGB\n", 100*b/l, l/1073741824; \
+			  if (w > 0 && g < w/10) { \
+			    printf "  reads               %d vs %d writes — WRITE-ONLY\n", g, w; \
+			    printf "  NOTE  sccache is not reading the cache. SCCACHE_RECACHE is\n"; \
+			    printf "        presence-tested, so even =false disables reads.\n"; \
+			  } else if (h+m > 0) { \
+			    printf "  hit_rate            %.1f%% over %d reads\n", 100*h/(h+m), g; \
+			  } }'
+
+CACHE_STATE := /tmp/.rocm-cache-prev
+
+# Lifetime counters average over every build since memcached started, so
+# they say nothing about the build in front of you. This prints current
+# state plus the delta since the previous call, which is the number that
+# moves while a build runs.
+cache-summary: ## One-line cache state plus deltas since the last call
+	@printf 'stats\r\nquit\r\n' | timeout 2 nc $(MEMCACHED_HOST) $(MEMCACHED_PORT) 2>/dev/null \
+		| awk -F'[ \r]' '/^STAT (cmd_get|cmd_set|get_hits|curr_items|bytes|limit_maxbytes|evictions|extstore_pages_used) /{v[$$2]=$$3} \
+			END { printf "%s %s %s %s %s %s %s %s\n", \
+				v["cmd_get"]+0, v["cmd_set"]+0, v["get_hits"]+0, v["curr_items"]+0, \
+				v["bytes"]+0, v["limit_maxbytes"]+0, v["evictions"]+0, v["extstore_pages_used"]+0 }' \
+		> $(CACHE_STATE).now 2>/dev/null; \
+	if [ ! -s $(CACHE_STATE).now ]; then \
+		echo "══ sccache store unreachable at $(MEMCACHED_HOST):$(MEMCACHED_PORT)"; \
+	else \
+		[ -s $(CACHE_STATE) ] || cp $(CACHE_STATE).now $(CACHE_STATE); \
+		paste $(CACHE_STATE).now $(CACHE_STATE) \
+		| awk '{ \
+			g=$$1; w=$$2; h=$$3; i=$$4; b=$$5; l=$$6; e=$$7; x=$$8; \
+			pg=$$9; pw=$$10; ph=$$11; \
+			dg=g-pg; dw=w-pw; dh=h-ph; \
+			printf "══ sccache store\n"; \
+			printf "items=%d  ram=%.2f/%.0fGB  disk_pages=%d  evict=%d\n", \
+				i, b/1073741824, l/1073741824, x, e; \
+			if (dg+dw == 0) { \
+				printf "idle  (no cache traffic since last refresh)\n"; \
+			} else if (dg < dw/10) { \
+				printf "+%d writes  +%d reads  WRITE-ONLY — sccache is not reading (SCCACHE_RECACHE set?)\n", dw, dg; \
+			} else { \
+				printf "+%d writes  +%d reads  hit=%.0f%% this interval\n", \
+					dw, dg, (dg>0 ? 100*dh/dg : 0); \
+			} }'; \
+		mv $(CACHE_STATE).now $(CACHE_STATE); \
+	fi
 
 cache-check: ## Verify every build node can reach the compiler cache
 	@for h in localhost $(THINK_HOST) $(GAMING_HOST); do \
@@ -262,19 +306,10 @@ WATCH_BUILDERS ?= $(shell docker buildx ls 2>/dev/null | awk 'NR>1 && /^[^ ]/ {g
 watch: ## Live build history across all snoc-* builders (WATCH_BUILDERS=, WATCH_LINES=)
 	@command -v watch > /dev/null || { echo "watch(1) not found: apt-get install procps"; exit 1; }
 	@watch -n $(WATCH_INTERVAL) -t --color ' \
-		printf "stats\\r\\nquit\\r\\n" \
-			| timeout 2 nc $(MEMCACHED_HOST) $(MEMCACHED_PORT) 2>/dev/null \
-			| awk -F"[ \r]" " \
-				/^STAT get_hits/{h=\$$3} /^STAT get_misses/{m=\$$3} \
-				/^STAT cmd_set/{w=\$$3} /^STAT curr_items/{i=\$$3} \
-				/^STAT bytes /{b=\$$3} /^STAT limit_maxbytes/{l=\$$3} \
-				/^STAT evictions/{e=\$$3} /^STAT extstore_pages_used/{x=\$$3} \
-				END { \
-					r = (h+m > 0) ? sprintf(\"%.0f%%\", 100*h/(h+m)) : \"n/a\"; \
-					printf \"══ sccache store\\n\"; \
-					printf \"items=%s  writes=%s  hit=%s  ram=%.1f/%.0fGB  disk_pages=%s  evict=%s\\n\", \
-						i, w, r, b/1073741824, l/1073741824, x, e }" \
-			|| echo "══ sccache store unreachable at $(MEMCACHED_HOST):$(MEMCACHED_PORT)"; \
+		printf "\\033[1mROCm PyTorch Build\\033[0m — watching %s · refresh %ss · %s\\n" \
+			"$(strip $(WATCH_BUILDERS))" "$(WATCH_INTERVAL)" "$$(date +%H:%M:%S)"; \
+		echo; \
+		$(MAKE_BIN) --no-print-directory cache-summary; \
 		echo; \
 		for b in $(WATCH_BUILDERS); do \
 			out=$$(docker buildx history ls --builder $$b 2>/dev/null | tail -n +2); \
@@ -409,7 +444,7 @@ COLD_TARGET ?= pytorch
 
 cold-build: builder-ensure ## Fully cold build (no layer or compiler cache). COLD_TARGET=
 	@echo "Cold build of $(COLD_TARGET) on $(BUILDER): no layer cache, no sccache hits."
-	$(call bake,$(COLD_TARGET),--no-cache --set "*.args.SCCACHE_RECACHE=true")
+	$(call bake,$(COLD_TARGET),--no-cache --set "*.args.FORCE_RECACHE=true")
 
 # ─── Push Targets ────────────────────────────────────────────────
 # --push replaces the image output, so these build and push in one pass

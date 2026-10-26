@@ -39,8 +39,14 @@ RUN git clone --depth 1 --branch v${PYTORCH_VERSION} --recurse-submodules \
 WORKDIR /opt/pytorch
 
 # ─── sccache compiler cache ──────────────────────────────────────
-# Install sccache binary (prebuilt from Mozilla releases)
-ARG SCCACHE_VERSION=0.7.7
+# Install sccache binary (prebuilt from Mozilla releases).
+#
+# The floor is 0.8.0, not a preference. Before it, gcc.rs had no "hip"
+# arm in its -x handling and fell through to cannot_cache!("-x"), so
+# every hipcc device compile was refused: a gfx950 build cached its C++
+# objects and recompiled every GPU kernel, which are the expensive ones.
+# Measured on 0.7.7: 990 of 1003 non-cacheable calls were "-x".
+ARG SCCACHE_VERSION=0.19.0
 RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
     -o /tmp/sccache.tar.gz && \
     mkdir -p /usr/local/bin && \
@@ -69,11 +75,13 @@ RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_
 ARG SCCACHE_MEMCACHED=tcp://snoc-strix.fold-leaffish.ts.net:11211
 ARG SCCACHE_SERVER_PORT=4250
 # true forces every compile to run and repopulate: a genuinely cold build.
-ARG SCCACHE_RECACHE=false
+# Deliberately NOT named SCCACHE_RECACHE. A build ARG is injected into
+# every RUN step's environment, and sccache presence-tests that name, so
+# merely declaring the ARG forces recache mode regardless of its value.
+ARG FORCE_RECACHE=false
 ENV SCCACHE_MEMCACHED=${SCCACHE_MEMCACHED} \
     SCCACHE_SERVER_PORT=${SCCACHE_SERVER_PORT} \
     SCCACHE_IGNORE_CLIENT_VERSION=1 \
-    SCCACHE_RECACHE=${SCCACHE_RECACHE} \
     CMAKE_C_COMPILER_LAUNCHER=sccache \
     CMAKE_CXX_COMPILER_LAUNCHER=sccache \
     CMAKE_HIP_COMPILER_LAUNCHER=sccache
@@ -162,7 +170,19 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # the build in this environment so it sees ROCm, the pinned Python and
 # the sccache launchers; it means the build requirements have to be
 # present already, which the previous step installs.
-RUN python -m build --wheel --no-isolation \
+# SCCACHE_RECACHE must be set ONLY when a forced recache is wanted.
+# sccache checks presence, never value:
+#     let force_recache = env_vars.iter().any(|(k, _v)| k == "SCCACHE_RECACHE");
+# so SCCACHE_RECACHE=false enables it exactly as =true does. Exporting it
+# unconditionally put every build in write-only mode — sccache never read
+# the cache, so no build could ever hit.
+RUN if [ "${FORCE_RECACHE}" = "true" ] || [ "${FORCE_RECACHE}" = "1" ]; then \
+        export SCCACHE_RECACHE=1; \
+        echo "sccache: forced recache ON — cache reads disabled for this build"; \
+    else \
+        echo "sccache: normal mode — cache reads enabled"; \
+    fi; \
+    python -m build --wheel --no-isolation \
     --outdir /opt/pytorch/dist \
     2>&1 | tee /opt/pytorch/build.log \
     && sccache --show-stats | tee /opt/pytorch/sccache-stats.txt

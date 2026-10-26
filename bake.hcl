@@ -71,7 +71,7 @@ variable "GIT_REF" {
 # otherwise produce identical tags and silently overwrite each other.
 # The Makefile passes it; empty means "no repo tag", not "unknown".
 variable "AITER_REF" {
-  default = "main"
+  default = "v0.1.27"
 }
 
 variable "VCS_REF" {
@@ -110,13 +110,18 @@ variable "SCCACHE_MEMCACHED" {
 # Port for the sccache server started inside the build container. Must
 # not collide with the node's own sccache.service (4226), because
 # builders run with --driver-opt network=host.
+# 0.8.0 is the floor for caching hipcc -x hip; see Dockerfile.pytorch.
+variable "SCCACHE_VERSION" {
+  default = "0.19.0"
+}
+
 variable "SCCACHE_SERVER_PORT" {
   default = "4250"
 }
 
 # 1 = refuse to start a PyTorch compile with no sccache server, rather
 # than spending an hour rebuilding everything uncached.
-variable "SCCACHE_RECACHE" {
+variable "FORCE_RECACHE" {
   default = "false"
 }
 
@@ -206,7 +211,8 @@ target "pytorch" {
     # the port and the strictness toggle are worth overriding here.
     SCCACHE_MEMCACHED    = SCCACHE_MEMCACHED
     SCCACHE_SERVER_PORT  = SCCACHE_SERVER_PORT
-    SCCACHE_RECACHE      = SCCACHE_RECACHE
+    SCCACHE_VERSION      = SCCACHE_VERSION
+    FORCE_RECACHE        = FORCE_RECACHE
     REQUIRE_SCCACHE      = REQUIRE_SCCACHE
   }
 

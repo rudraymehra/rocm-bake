@@ -10,14 +10,14 @@
 #   5. Starts the sccache server
 #
 # Examples:
-#   ./deploy-sccache.sh strix                   # Strix, defaults (0.7.7, 200G, port 4226)
-#   ./deploy-sccache.sh think 0.7.7             # Think with a specific version
-#   ./deploy-sccache.sh strix 0.7.7 500G 4226   # custom cache size and port
+#   ./deploy-sccache.sh strix                   # Strix, defaults (0.19.0, 200G, port 4226)
+#   ./deploy-sccache.sh think 0.19.0            # a specific version
+#   ./deploy-sccache.sh strix 0.19.0 500G 4226  # custom cache size and port
 
 set -euo pipefail
 
 MACHINE="${1:-strix}"
-VERSION="${2:-0.7.7}"
+VERSION="${2:-0.19.0}"
 CACHE_SIZE="${3:-200G}"
 # sccache's own default. Port 9000 is taken by lemond/tailscaled on Strix.
 SERVER_PORT="${4:-4226}"
