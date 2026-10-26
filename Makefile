@@ -54,6 +54,7 @@ endif
         build-status build-logs build-inspect builder-ensure watch \
         cold-build build-aiter push-aiter aiter-wheel \
         build-wheel push-wheel wheel \
+        build-triton push-triton triton-wheel \
         cache-stats cache-summary cache-check cache-logs builder-load \
         build-base build-pytorch build-runtime build-all \
         push-base push-pytorch push-runtime push-all \
@@ -101,7 +102,7 @@ zot-tags: ## List tags for a repo (REPO=rocm-pytorch/base)
 
 # Wheel artifacts are plain images whose only payload is /wheels, so
 # they show up in the catalog like anything else — this filters to them.
-WHEEL_REPOS ?= pytorch-wheel aiter
+WHEEL_REPOS ?= pytorch-wheel triton-wheel aiter
 zot-wheels: ## List wheel artifacts published to Zot
 	@for r in $(WHEEL_REPOS); do \
 		tags=$$(curl -sf "http://$(REGISTRY)/v2/$(REGISTRY_NAME)/$$r/tags/list" 2>/dev/null \
@@ -312,6 +313,9 @@ builder-logs: ## Tail buildkitd's own log for each node of $(BUILDER)
 # output is lost and the shell prints "Terminated" into the display.
 WATCH_INTERVAL ?= 5
 WATCH_LINES ?= 20
+# Build records shown per builder. The full list grows without bound and
+# pushes the running build off screen.
+WATCH_HISTORY ?= 5
 WATCH_TMP := /tmp/.rocm-build-watch.log
 # Every snoc-* builder, so a build started on any node shows up. The pool
 # keeps its own buildkit instances separate from the single-node
@@ -330,7 +334,8 @@ watch: ## Live build history across all snoc-* builders (WATCH_BUILDERS=, WATCH_
 		$(MAKE_BIN) --no-print-directory cache-summary; \
 		echo; \
 		for b in $(WATCH_BUILDERS); do \
-			out=$$(docker buildx history ls --builder $$b 2>/dev/null | tail -n +2); \
+			out=$$(docker buildx history ls --builder $$b 2>/dev/null \
+				| tail -n +2 | head -$(WATCH_HISTORY)); \
 			[ -n "$$out" ] || continue; \
 			echo "══ $$b"; \
 			echo "$$out"; \
@@ -498,6 +503,19 @@ build-wheel: builder-ensure ## Build the torch wheel image locally
 wheel: ## Extract the torch wheel from Zot into ./dist
 	@mkdir -p dist
 	@printf 'FROM %s/%s/pytorch-wheel:latest\n' "$(REGISTRY)" "$(REGISTRY_NAME)" \
+		| docker buildx build --builder $(BUILDER) \
+			--output type=local,dest=dist -
+	@ls -la dist/wheels/
+
+build-triton: builder-ensure ## Build the Triton wheel for our ROCm
+	$(call bake,triton)
+
+push-triton: builder-ensure ## Build and push the Triton wheel image
+	$(call bake,triton,--push)
+
+triton-wheel: ## Extract the Triton wheel from Zot into ./dist
+	@mkdir -p dist
+	@printf 'FROM %s/%s/triton-wheel:latest\n' "$(REGISTRY)" "$(REGISTRY_NAME)" \
 		| docker buildx build --builder $(BUILDER) \
 			--output type=local,dest=dist -
 	@ls -la dist/wheels/

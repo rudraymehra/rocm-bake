@@ -70,6 +70,14 @@ variable "GIT_REF" {
 # one. Two builds of the same PyTorch version from different repo states
 # otherwise produce identical tags and silently overwrite each other.
 # The Makefile passes it; empty means "no repo tag", not "unknown".
+# PyTorch v2.14.1's own pins: .ci/docker/triton_version.txt (3.8.0) and
+# .ci/docker/ci_commit_pins/triton.txt. Building this commit gives the
+# triton PyTorch expects, for ROCm 10.1 instead of AMD's newest
+# published channel (7.2.0).
+variable "TRITON_REF" {
+  default = "675c59878aa2280b31f722aaf42b825fcee21de8"
+}
+
 variable "AITER_REF" {
   default = "v0.1.27"
 }
@@ -242,6 +250,43 @@ target "pytorch-wheel" {
     "org.opencontainers.image.description" = "torch wheel for ${PYTORCH_ROCM_ARCH}, ROCm ${ROCM_VERSION}"
     "org.opencontainers.image.version"     = "${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}"
   })
+}
+
+# ─── Triton wheel ────────────────────────────────────────────────
+# Builds FROM the ROCm base, not from pytorch: triton needs cmake<4
+# while PyTorch pulls cmake 4.x, so they cannot share an environment.
+# That also means it can build in parallel with pytorch on another node.
+target "triton" {
+  dockerfile = "Dockerfile.triton"
+  platforms  = ["linux/amd64"]
+  target     = "wheel"
+
+  tags = compact([
+    "${REGISTRY}/${REGISTRY_NAME}/triton-wheel:${ROCM_VERSION}-${ARCH_TAG}",
+    "${REGISTRY}/${REGISTRY_NAME}/triton-wheel:latest",
+    VCS_REF != "" ? "${REGISTRY}/${REGISTRY_NAME}/triton-wheel:${ROCM_VERSION}-${ARCH_TAG}-g${VCS_REF}" : "",
+  ])
+
+  labels = merge(OCI_LABELS, {
+    "org.opencontainers.image.title"       = "triton wheel"
+    "org.opencontainers.image.description" = "Triton 3.8.0 built for ROCm ${ROCM_VERSION}, ${PYTORCH_ROCM_ARCH}"
+    "org.opencontainers.image.version"     = "${ROCM_VERSION}-${ARCH_TAG}"
+  })
+
+  cache-from = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/triton-cache:latest,mode=max,registry.insecure=true"]
+  cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/triton-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
+
+  args = {
+    BASE_IMAGE          = "${REGISTRY}/${REGISTRY_NAME}/base:${ROCM_VERSION}-${PYTHON_VERSION}"
+    TRITON_REF          = TRITON_REF
+    PYTORCH_ROCM_ARCH   = PYTORCH_ROCM_ARCH
+    ROCM_VERSION        = ROCM_VERSION
+    SCCACHE_VERSION     = SCCACHE_VERSION
+    SCCACHE_MEMCACHED   = SCCACHE_MEMCACHED
+    SCCACHE_SERVER_PORT = SCCACHE_SERVER_PORT
+  }
+
+  output = ["type=image,compression=zstd"]
 }
 
 # ─── AITER wheel ─────────────────────────────────────────────────

@@ -1,0 +1,98 @@
+# syntax=docker/dockerfile:1
+# Triton built from source against this image's ROCm.
+#
+# Why build it at all: AMD publishes prebuilt triton only for ROCm 7.0,
+# 7.1 and 7.2 (https://pypi.amd.com/triton/release_0914/). Every 7.3+
+# and 10.x channel returns 403. Our runtime is ROCm 10.1, so there is no
+# matching wheel to install — AITER's own installer falls back to the
+# 7.2.0 channel, three ROCm majors behind.
+#
+# Why its own image rather than a stage of Dockerfile.pytorch: triton
+# requires cmake>=3.20,<4.0, while PyTorch pulls cmake 4.x and needs
+# CMAKE_POLICY_VERSION_MINIMUM=3.5 to tolerate its vendored deps. The two
+# constraints cannot share an environment.
+#
+# The version and commit are PyTorch's own pins, so the result is the
+# triton that v2.14.1 expects — just built for ROCm 10.1 instead of 7.2:
+#   .ci/docker/triton_version.txt        -> 3.8.0
+#   .ci/docker/ci_commit_pins/triton.txt -> 675c5987...
+
+ARG BASE_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/base:10.1.0-full-3.14
+FROM ${BASE_IMAGE} AS builder
+
+ARG TRITON_REF=675c59878aa2280b31f722aaf42b825fcee21de8
+ARG PYTORCH_ROCM_ARCH=gfx950
+ARG ROCM_VERSION=10.1.0-full
+ARG SCCACHE_MEMCACHED=tcp://snoc-strix.fold-leaffish.ts.net:11211
+ARG SCCACHE_SERVER_PORT=4250
+
+LABEL org.opencontainers.image.source="https://github.com/triton-lang/triton"
+LABEL org.opencontainers.image.description="Triton built for ROCm ${ROCM_VERSION}, ${PYTORCH_ROCM_ARCH}"
+
+# MAX_JOBS mirrors PyTorch CI; without it triton's cmake serialises more
+# than it needs to on a 32-core node.
+ENV MAX_JOBS=32 \
+    ROCM_PATH=/opt/rocm \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+    SCCACHE_MEMCACHED=${SCCACHE_MEMCACHED} \
+    SCCACHE_SERVER_PORT=${SCCACHE_SERVER_PORT} \
+    SCCACHE_IGNORE_CLIENT_VERSION=1 \
+    CMAKE_C_COMPILER_LAUNCHER=sccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+# sccache is installed in the base image's builder lineage, not here.
+ARG SCCACHE_VERSION=0.19.0
+RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    -o /tmp/sccache.tar.gz && \
+    tar xzf /tmp/sccache.tar.gz -C /usr/local/bin --strip-components=1 \
+        "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" && \
+    rm /tmp/sccache.tar.gz && chmod +x /usr/local/bin/sccache && sccache --version
+
+# Submodules carry the in-tree backends, including amd.
+RUN git clone https://github.com/triton-lang/triton.git /opt/triton && \
+    cd /opt/triton && \
+    git checkout ${TRITON_REF} && \
+    git submodule update --init --recursive --depth 1
+
+WORKDIR /opt/triton
+
+# cmake<4 per triton's [build-system].requires. Installing it into the
+# venv shadows the system cmake for this build only.
+#
+# pybind11 is pinned to 3.0.1 to match PyTorch CI's recipe
+# (.ci/docker/common/install_triton.sh) rather than taking whatever
+# >=2.13.1 resolves to today.
+RUN pip install --no-cache-dir build "cmake>=3.20,<4.0" "ninja>=1.11.1" \
+        "pybind11==3.0.1" "setuptools>=40.8.0" wheel && \
+    cmake --version
+
+# PyTorch CI rewrites a stale LLVM build host here as a workaround for
+# triton#4527. At our pinned commit setup.py no longer references either
+# host, so the rewrite is a no-op — kept because it costs nothing and
+# older pins still need it. Deliberately not verified afterwards: `grep
+# -c` exits 1 on no match, which turned "workaround unnecessary" into a
+# failed build.
+RUN sed -i -e 's|https://tritonlang.blob.core.windows.net/llvm-builds|https://oaitriton.blob.core.windows.net/public/llvm-builds|g' setup.py && \
+    echo "llvm host references: $(grep -c 'blob.core.windows.net' setup.py || true)"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Triton fetches a prebuilt LLVM matching cmake/llvm-hash.txt unless
+# TRITON_LLVM_DIR points at one; the download dominates the first build.
+RUN python -m build --wheel --no-isolation \
+    --outdir /wheels \
+    2>&1 | tee /wheels-build.log \
+    && sccache --show-stats | tee /wheels-sccache-stats.txt
+
+RUN ls -la /wheels/
+
+# ─── Wheel-only image ────────────────────────────────────────────
+FROM scratch AS wheel
+
+ARG PYTORCH_ROCM_ARCH
+ARG ROCM_VERSION
+LABEL org.opencontainers.image.source="https://github.com/triton-lang/triton"
+LABEL org.opencontainers.image.description="Triton wheel for ROCm ${ROCM_VERSION}, ${PYTORCH_ROCM_ARCH}"
+
+COPY --from=builder /wheels/ /wheels/
+COPY --from=builder /wheels-build.log /wheels-sccache-stats.txt /
