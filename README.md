@@ -10,28 +10,28 @@ Automated build pipeline for PyTorch with ROCm support optimized for AMD Strix H
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                         SNOC Build Network                                │
 │                                                                          │
-│  ┌──────────────────────┐          ┌──────────────────────┐              │
-│  │   SNOC Strix         │          │   SNOC Think          │              │
-│  │   (Primary Build)    │          │   (Secondary Build)   │              │
-│  │                      │          │                       │              │
-│  │  AMD gfx950 GPU      │          │  GPU + Build Worker   │              │
-│  │  ~64GB RAM           │          │  ~16GB RAM            │              │
-│  │  BuildKitd           │          │  BuildKitd            │              │
-│  │  sccache server      │          │  sccache server       │              │
-│  │  Docker (container)  │          │  Docker               │              │
-│  │                      │          │                       │              │
-│  │  ROCm 7.1+           │          │  ROCm 7.1+            │              │
-│  └──────────┬───────────┘          └──────────┬───────────┘              │
-│             │                                  │                           │
-│             │       Tailscale Mesh (10.64.x.x) │                           │
-│             │──────────────────────────────────│                           │
-│             │                                  │                           │
-│             ▼                                  ▼                           │
+│  ┌──────────────────────┐   ┌──────────────────┐  ┌─────────────────┐    │
+│  │   SNOC Strix         │   │ snoc-thinkstation│  │  snoc-gaming    │    │
+│  │   (Primary Build)    │   │  (Build node)    │  │  (Build node)   │    │
+│  │                      │   │                  │  │                 │    │
+│  │  AMD gfx950 GPU      │   │  gfx1201 (RDNA4) │  │ gfx1201 (RDNA4) │    │
+│  │  ~64GB RAM           │   │  Docker 29+      │  │ Docker 29+      │    │
+│  │  buildx node (local) │   │  buildx via SSH  │  │ buildx via SSH  │    │
+│  │  sccache server      │   │  cross-compile   │  │ cross-compile   │    │
+│  │  zot.service         │   │  only, no test   │  │ only, no test   │    │
+│  │                      │   │                  │  │                 │    │
+│  │  100.91.58.37        │   │  100.68.21.9     │  │ 100.70.171.36   │    │
+│  └──────────┬───────────┘   └────────┬─────────┘  └────────┬────────┘    │
+│             │                        │                     │              │
+│             │          Tailscale Mesh (100.x.y.z)          │              │
+│             │────────────────────────┴─────────────────────┘              │
+│             │                                                             │
+│             ▼                                                             │
 │  ┌──────────────────────────────────────────────────────────────┐         │
-│  │              Zot Registry (on Strix)                          │         │
-│  │              localhost:5000                                    │         │
+│  │         Zot Registry (bare metal on Strix, zot.service)       │         │
+│  │         100.91.58.37:8080                  │         │
 │  │                                                              │         │
-│  │  • Pull-through cache → Docker Hub, GHCR, NVCR               │         │
+│  │  • Pull-through sync → Docker Hub, GHCR, Quay                │         │
 │  │  • BuildKit layer cache as OCI artifacts                      │         │
 │  │  • PyTorch/ROCm image storage                                 │         │
 │  │  • sccache cache directory shared via bind mount              │         │
@@ -76,11 +76,11 @@ Automated build pipeline for PyTorch with ROCm support optimized for AMD Strix H
            ▼
      sccache ↔ sccache
      compiler   server
-     cache      (port 9000)
+     cache      (port 4226)
            │
            ▼
      Push to Zot
-     localhost:5000
+     100.91.58.37:8080
 ```
 
 ### Build Machine Roles
@@ -88,14 +88,22 @@ Automated build pipeline for PyTorch with ROCm support optimized for AMD Strix H
 **SNOC Strix (Primary)**
 - gfx950 GPU with full ROCm stack
 - 64GB shared memory (16GB reserved for host)
-- Runs Zot registry, sccache server, BuildKitd with containerd worker
+- Hosts the Zot registry (bare-metal `zot.service`, managed outside this
+  repo) and the sccache server
 - Primary build target — builds run here by default
+- The only node that can run the GPU test stage
 
-**SNOC Think (Secondary)**
-- Backup build node with ROCm support
-- Connects via Tailscale mesh network
-- Shares sccache cache directory for cross-node compiler caching
-- Can run distributed builds via remote BuildKitd endpoint
+**snoc-thinkstation / snoc-gaming (Build nodes)**
+
+- Joined to buildx over SSH to their Docker daemons: buildx creates and
+  owns a buildkit container on each, so neither needs buildkitd, TLS
+  certs, or the buildx plugin installed
+- Both gfx1201 (RDNA4) — they cross-compile for gfx950 fine, but cannot
+  run `make test`
+- Reach Zot over the tailnet at `100.91.58.37:8080`
+- `make builder-pool` groups all three into one builder named `pool`,
+  which fans build *targets* out across nodes (it does not split a single
+  image across them)
 
 ### Docker Image Lifecycle
 
@@ -112,10 +120,10 @@ Dockerfile.base          Dockerfile.pytorch        Dockerfile.runtime
 
 ## Components
 
-- **Zot Registry** - Lightweight OCI registry with pull-through caching for Docker Hub, GHCR, and NVCR
+- **Zot Registry** - Lightweight OCI registry with on-demand sync from Docker Hub, GHCR, and Quay. Runs bare-metal on Strix as `zot.service`; this repo consumes it and never starts, stops, or configures it
 - **Buildx Bake** - Declarative multi-stage build definitions with cache management
 - **Dockerfiles** - Three stages: base → build → runtime
-- **sccache** - Compiler cache server on port 9000 (200GB cache per node)
+- **sccache** - Compiler cache server on port 4226 (200GB cache per node)
 - **BuildKitd** - BuildKit daemon with ROCm GPU passthrough
 - **Telemetry** - Prometheus text collector for build metrics
 
@@ -132,58 +140,88 @@ Dockerfile.base          Dockerfile.pytorch        Dockerfile.runtime
 # Disk: 200GB+ for build cache
 ```
 
-### SNOC Think (Secondary Build Machine)
+### snoc-thinkstation / snoc-gaming (Build nodes)
 
 ```bash
-# BuildKitd exposed on port 1234
-# ROCm 7.14+
-# Network: snoc-think reachable via Tailscale (10.64.x.x)
+# Docker 27+ (no buildkitd, no TLS certs, no buildx plugin needed)
+# Reachable as `ssh snoc-thinkstation` / `ssh snoc-gaming` from Strix
+# Able to reach http://100.91.58.37:8080 over the tailnet
 # Disk: 200GB+ for build cache
 ```
 
 ## Quick Start
 
-### 1. Deploy Zot Registry
+### 1. Check the Zot Registry
+
+Zot already runs on Strix as a bare-metal systemd service, deployed from
+elsewhere. This repo uses it as-is — there is nothing to start here, and
+starting a second registry would fight the one the rest of the fleet
+pulls through.
 
 ```bash
-cd zot
-docker compose up -d
+make zot-check     # service active + registry reachable
+make zot-catalog   # what it currently holds
+make zot-logs      # journalctl -u zot -f
 ```
 
-Verify Zot is running:
+Reads are anonymous. Pushes need the `ci` account from
+`/etc/zot/htpasswd`:
+
 ```bash
-curl -s http://localhost:5000/v2/_catalog
+docker login 100.91.58.37:8080 -u ci
 ```
+
+It serves plain HTTP on the tailnet, so clients must trust it explicitly.
+The Docker daemon reads `/etc/docker/daemon.json`:
+
+```json
+{
+  "insecure-registries": ["100.91.58.37:8080"],
+  "registry-mirrors": ["http://100.91.58.37:8080"]
+}
+```
+
+BuildKit does not inherit that — it reads
+`.builders/buildkitd-strix.toml`, which `make builder-strix` passes via
+`--config`.
 
 ### 2. Configure Buildx Builders
 
 On **SNOC Strix**:
 ```bash
-# Create docker-container driver builder
-docker buildx create --name strix --driver docker-container
+# Create docker-container driver builder. --config is required: without
+# it buildkit will not talk plain HTTP to Zot.
+docker buildx create --name strix --driver docker-container \
+  --config .builders/buildkitd-strix.toml
 docker buildx use strix
 ```
 
-On **SNOC Think** (optional, for distributed builds):
+Add the other nodes (they join over SSH; nothing to install on them):
+
 ```bash
-# Ensure buildkitd is running and exposed
-# Verify remote builder connectivity
-docker buildx create --name think --driver remote tcp://snoc-think:1234
+make builder-think     # snoc-thinkstation
+make builder-gaming    # snoc-gaming
+make builder-pool      # all three as one builder named "pool"
+make builder-status    # docker buildx ls
 ```
 
-### 3. Deploy sccache on Both Nodes
+Then build on the whole fleet with `make build-all BUILDER=pool`, or on
+one node with `docker buildx bake -f bake.hcl --builder think pytorch`.
+
+### 3. Deploy sccache on All Nodes
 
 ```bash
 # Deploy to Strix
-sudo ./deploy-sccache.sh strix 0.7.7 200G
+sudo ./.builders/deploy-sccache.sh strix
 
-# Deploy to Think
-sudo ./deploy-sccache.sh think 0.7.7 200G
+# Deploy to the other nodes
+ssh snoc-thinkstation 'sudo ./.builders/deploy-sccache.sh think'
+ssh snoc-gaming       'sudo ./.builders/deploy-sccache.sh gaming'
 ```
 
 Verify sccache is running:
 ```bash
-sccache --show-stats
+SCCACHE_SERVER_PORT=4226 sccache --show-stats
 ```
 
 ### 4. Build PyTorch
@@ -222,8 +260,8 @@ docker buildx bake -f bake.hcl --builder strix pytorch
 
 ```bash
 # Run the built image with GPU access
-docker run --rm -it --gpus all \
-  localhost:5000/rocm-pytorch/pytorch:2.14.1-7.14-gfx950
+docker run --rm -it --device /dev/kfd --device /dev/dri \
+  100.91.58.37:8080/rocm-pytorch/pytorch:2.14.1-7.14-gfx950
 ```
 
 Expected output:
@@ -254,7 +292,7 @@ pytorch-run (depends on pytorch output)
 1. **BuildKit Layer Cache** → Stored in Zot as OCI artifacts
 2. **sccache Compiler Cache** → Per-node local storage (200GB)
 3. **Pull-Through Cache** → Zot caches Docker Hub/GHCR/NVCR images on demand
-4. **Multi-Builder** → Builds distribute across Strix and Think
+4. **Multi-Builder** → Targets fan out across Strix, Thinkstation and Gaming
 
 ### Build Configuration
 
@@ -384,9 +422,10 @@ docker buildx bake -f bake.hcl \
 ### Cache Configuration
 
 Cache is stored in Zot at:
-- `localhost:5000/rocm-pytorch/base-cache` - Base image cache
-- `localhost:5000/rocm-pytorch/pytorch-cache` - PyTorch build cache
-- `localhost:5000/rocm-pytorch/runtime-cache` - Runtime cache
+
+- `100.91.58.37:8080/rocm-pytorch/base-cache` - Base image cache
+- `100.91.58.37:8080/rocm-pytorch/pytorch-cache` - PyTorch build cache
+- `100.91.58.37:8080/rocm-pytorch/runtime-cache` - Runtime cache
 
 To use cache from another build:
 ```bash
@@ -424,7 +463,7 @@ HIP_ARCHITECTURES="gfx900;gfx940;gfx941;gfx942;gfx950;gfx1100;gfx1101;gfx1102"
 1. **Layer caching** - Base image built first, cached in Zot
 2. **Incremental builds** - Changes to PyTorch source only rebuild affected layers
 3. **Registry cache** - Cache stored in Zot, accessible from any builder
-4. **Multi-builder** - Distribute builds across Strix and Think
+4. **Multi-builder** - Fan targets out across Strix, Thinkstation and Gaming
 5. **Compression** - Output compressed with zstd for smaller image size
 6. **sccache** - Compiler-level caching skips redundant HIP/CUDA compilation
 7. **Telemetry** - Real-time metrics for monitoring build health and cache efficiency
@@ -444,15 +483,22 @@ ls -la /dev/kfd /dev/dri
 ### Zot connection refused
 
 ```bash
-# Check Zot container status
-docker ps | grep zot
+# Check the Zot service (bare metal, not a container)
+systemctl status zot
 
 # Check Zot logs
-docker logs zot-registry
+sudo journalctl -u zot -n 50
 
 # Verify registry API
-curl -s http://localhost:5000/v2/_catalog
+curl -s http://100.91.58.37:8080/v2/_catalog
 ```
+
+If the API answers but builds still fail on TLS, the client does not
+trust the plain-HTTP registry: check `insecure-registries` in
+`/etc/docker/daemon.json` for the Docker daemon, and confirm the builder
+was created with `--config .builders/buildkitd-strix.toml` for BuildKit
+(`docker buildx inspect strix`). If pushes get 401, `docker login
+100.91.58.37:8080 -u ci`.
 
 ### Buildx builder not available
 
