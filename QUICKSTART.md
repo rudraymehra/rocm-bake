@@ -47,12 +47,32 @@ snoc-strix.fold-leaffish.ts.net:8080`. To see what it holds:
 make zot-catalog
 ```
 
-Anonymous read is open; pushing needs the `ci` account from
-`/etc/zot/htpasswd`:
+Anonymous read is open — every pull, pull-through and cache read works
+unauthenticated. Only pushing needs the `ci` account from
+`/etc/zot/htpasswd`.
+
+Store the credential with `pass`, which is GPG-encrypted at rest and
+works over SSH. The `secretservice` helper does not: it fails with
+`Cannot create an item in a locked collection` whenever the gnome-keyring
+login collection has not been unlocked by a graphical session.
 
 ```bash
+sudo apt-get install -y pass golang-docker-credential-helpers
+pass init <your-gpg-key-id>          # gpg --list-secret-keys --keyid-format=long
+# set "credsStore": "pass" in ~/.docker/config.json
 docker login snoc-strix.fold-leaffish.ts.net:8080 -u ci
 ```
+
+Verify it landed:
+
+```bash
+docker-credential-pass list
+```
+
+One login on Strix is enough for the whole fleet. buildx sends registry
+auth from your local Docker config to the builder as a session
+attachment, so builds pushing from think or gaming use it too — those
+nodes never need their own credential.
 
 The registry serves plain HTTP over the tailnet, so the Docker daemon
 needs it in `/etc/docker/daemon.json` (already set on Strix):
@@ -67,10 +87,10 @@ needs it in `/etc/docker/daemon.json` (already set on Strix):
 ## Step 3 — Create the buildx builder (Strix)
 
 ```bash
-make builder-strix
+make builder-snoc-strix
 ```
 
-The builder needs `.builders/buildkitd-strix.toml` — `make builder-strix`
+The builder needs `.builders/buildkitd-strix.toml` — `make builder-snoc-strix`
 passes it. That config carries three things builds cannot work without:
 plain HTTP to Zot, the Zot pull-through mirrors, and a `[dns]` block so
 RUN steps can resolve tailnet names (they get their own resolv.conf, not
@@ -78,14 +98,14 @@ the node's). Creating the builder by hand needs both flags: `--config`,
 and `network=host` so the builder itself resolves the registry.
 
 Both settings are baked in at create time. After editing the toml,
-`docker buildx rm strix && make builder-strix` — an existing builder
+`docker buildx rm snoc-strix && make builder-snoc-strix` — an existing builder
 does not pick up changes.
 
 ```bash
-docker buildx create --name strix --driver docker-container \
+docker buildx create --name snoc-strix --driver docker-container \
   --driver-opt network=host \
   --config .builders/buildkitd-strix.toml
-docker buildx use strix
+docker buildx use snoc-strix
 ```
 
 (Optional) Add the other two nodes. They join over SSH to their Docker
@@ -93,16 +113,16 @@ daemons, so nothing needs installing on them — no buildkitd, no TLS
 certs, not even the buildx plugin:
 
 ```bash
-make builder-think     # snoc-thinkstation
-make builder-gaming    # snoc-gaming
-make builder-pool      # all three as one builder named "pool"
+make builder-snoc-think     # snoc-think (runs on snoc-thinkstation)
+make builder-snoc-gaming    # snoc-gaming
+make builder-snoc-pool      # all three as one builder named "snoc-pool"
 make builder-status    # docker buildx ls
 ```
 
 Then target the whole fleet:
 
 ```bash
-make build-all BUILDER=pool
+make build-all BUILDER=snoc-pool
 ```
 
 The pool fans *targets* out across nodes; it does not split one image
@@ -140,7 +160,7 @@ container runs its own sccache client and server, pointed at this store.
 ```bash
 make build-all              # every target
 make build-pytorch          # just PyTorch (~30-60 min cold)
-make build-all BUILDER=pool # fan targets across all three nodes
+make build-all BUILDER=snoc-pool # fan targets across all three nodes
 ```
 
 Each `make build-*` runs through `telemetry/build.sh`, which records
@@ -154,7 +174,7 @@ rather than silently recompiling everything cold. To override:
 docker buildx bake -f bake.hcl --set '*.args.REQUIRE_SCCACHE=0' pytorch
 ```
 
-Push to Zot (needs `docker login snoc-strix.fold-leaffish.ts.net:8080 -u ci`):
+Push to Zot (needs the `ci` login from Step 2):
 
 ```bash
 make push-all

@@ -13,8 +13,8 @@
 #   docker buildx bake -f bake.hcl                     # build all (local)
 #   docker buildx bake -f bake.hcl --push              # build + push to Zot
 #   docker buildx bake -f bake.hcl pytorch             # build just pytorch
-#   docker buildx bake -f bake.hcl --builder strix pytorch
-#   docker buildx bake -f bake.hcl --builder think pytorch
+#   docker buildx bake -f bake.hcl --builder snoc-strix pytorch
+#   docker buildx bake -f bake.hcl --builder snoc-think pytorch
 #
 # Override variables at build time:
 #   docker buildx bake -f bake.hcl --set 'target.pytorch.args.PYTORCH_VERSION=2.14.1'
@@ -80,6 +80,10 @@ variable "SCCACHE_SERVER_PORT" {
 
 # 1 = refuse to start a PyTorch compile with no sccache server, rather
 # than spending an hour rebuilding everything uncached.
+variable "SCCACHE_RECACHE" {
+  default = "false"
+}
+
 variable "REQUIRE_SCCACHE" {
   default = "1"
 }
@@ -148,6 +152,7 @@ target "pytorch" {
     # the port and the strictness toggle are worth overriding here.
     SCCACHE_MEMCACHED    = SCCACHE_MEMCACHED
     SCCACHE_SERVER_PORT  = SCCACHE_SERVER_PORT
+    SCCACHE_RECACHE      = SCCACHE_RECACHE
     REQUIRE_SCCACHE      = REQUIRE_SCCACHE
   }
 
@@ -194,10 +199,10 @@ target "pytorch-test" {
 # builder-* targets in the Makefile, which also pass the buildkitd config
 # that teaches each node to reach Zot over plain HTTP.
 #
-#   make builder-strix    # local, gfx950, runs the GPU test stage
-#   make builder-think    # snoc-thinkstation over SSH, gfx1201
-#   make builder-gaming   # snoc-gaming over SSH, gfx1201
-#   make builder-pool     # all three as one builder
+#   make builder-snoc-strix    # snoc-strix: local, gfx950, runs the GPU tests
+#   make builder-snoc-think    # snoc-think: snoc-thinkstation over SSH, gfx1201
+#   make builder-snoc-gaming   # snoc-gaming: over SSH, gfx1201
+#   make builder-snoc-pool     # snoc-pool: all three as one builder
 #
 # Select one per invocation with --builder:
-#   docker buildx bake -f bake.hcl --builder pool pytorch
+#   docker buildx bake -f bake.hcl --builder snoc-pool pytorch

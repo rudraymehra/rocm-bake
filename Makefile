@@ -9,12 +9,14 @@ REGISTRY_NAME ?= rocm-pytorch
 PYTORCH_VERSION ?= 2.14.1
 ROCm_VERSION ?= 10.1.0-full
 PYTHON_VERSION ?= 3.12
-BUILDER ?= strix
+BUILDER ?= snoc-strix
+REPO ?= $(REGISTRY_NAME)/base
 
 # Remote build nodes. SSH endpoints, so these must be reachable as
 # `ssh <host>` from here (tailnet names work on the host; only builder
-# *containers* lack MagicDNS). There is no `snoc-think` on the tailnet —
-# the Thinkstation is snoc-thinkstation.
+# *containers* lack MagicDNS). Note the builder is named snoc-think but
+# the machine is snoc-thinkstation — there is no snoc-think on the
+# tailnet, so this variable keeps the real hostname.
 THINK_HOST ?= snoc-thinkstation
 GAMING_HOST ?= snoc-gaming
 
@@ -28,9 +30,9 @@ else
 BAKE = ./telemetry/build.sh
 endif
 
-.PHONY: help zot-check zot-catalog zot-logs \
-        builder-setup builder-strix builder-think builder-gaming \
-        builder-pool builder-status \
+.PHONY: help zot-check zot-catalog zot-tags zot-logs \
+        builder-setup builder-snoc-strix builder-snoc-think builder-snoc-gaming \
+        builder-snoc-pool builder-status builder-ensure \
         build-base build-pytorch build-runtime build-all \
         push-base push-pytorch push-runtime push-all \
         clean clean-cache test \
@@ -54,19 +56,26 @@ zot-check: ## Verify the Zot registry is reachable
 zot-catalog: ## List repositories in the Zot registry
 	@curl -sf http://$(REGISTRY)/v2/_catalog | python3 -m json.tool
 
+# curl, not docker: the Docker CLI cannot enumerate tags in a registry.
+# `docker search` only queries Docker Hub, and `docker manifest inspect`
+# needs a tag you already know. Listing them is a registry API call.
+zot-tags: ## List tags for a repo (REPO=rocm-pytorch/base)
+	@curl -sf http://$(REGISTRY)/v2/$(REPO)/tags/list 2>/dev/null | python3 -m json.tool 2>/dev/null \
+		|| echo "No such repository in $(REGISTRY): $(REPO)"
+
 zot-logs: ## Follow Zot registry logs
 	@sudo journalctl -u zot -f
 
 # ─── Buildx Builder Setup ────────────────────────────────────────
-builder-setup: builder-strix builder-think builder-gaming ## Setup all builders
+builder-setup: builder-snoc-strix builder-snoc-think builder-snoc-gaming ## Setup all builders
 
-builder-strix: ## Setup Strix builder (docker-container driver)
-	@if docker buildx ls --format '{{.Name}}' | grep -qx 'strix'; then \
-		echo "Strix builder already exists"; \
+builder-snoc-strix: ## Setup the snoc-strix builder (local docker-container)
+	@if docker buildx ls --format '{{.Name}}' | grep -qx 'snoc-strix'; then \
+		echo "snoc-strix builder already exists"; \
 	else \
-		echo "Creating Strix builder..."; \
+		echo "Creating snoc-strix builder..."; \
 		docker buildx create \
-			--name strix \
+			--name snoc-strix \
 			--driver docker-container \
 			--driver-opt network=host \
 			--config .builders/buildkitd-strix.toml \
@@ -74,21 +83,21 @@ builder-strix: ## Setup Strix builder (docker-container driver)
 			--driver-opt env.BUILDKIT_STEP_LOG_MAX_SPEED=10485760 \
 			--platform linux/amd64; \
 	fi
-	@docker buildx use strix
-	@echo "Strix builder active"
+	@docker buildx use snoc-strix
+	@echo "snoc-strix builder active"
 
 # snoc-thinkstation and snoc-gaming join over SSH to their Docker
 # daemons, not the remote/TLS driver: buildx creates and owns a buildkit
 # container on each, so neither node needs buildkitd, TLS certs, or the
 # buildx plugin installed. Both are gfx1201 (RDNA4), so they can
 # cross-compile for gfx950 but cannot run the GPU test stage.
-builder-think: ## Setup Thinkstation builder (docker-container over SSH)
-	@if docker buildx ls --format '{{.Name}}' | grep -qx 'think'; then \
-		echo "Think builder already exists"; \
+builder-snoc-think: ## Setup the snoc-think builder (over SSH to snoc-thinkstation)
+	@if docker buildx ls --format '{{.Name}}' | grep -qx 'snoc-think'; then \
+		echo "snoc-think builder already exists"; \
 	else \
-		echo "Creating Think builder..."; \
+		echo "Creating snoc-think builder..."; \
 		docker buildx create \
-			--name think \
+			--name snoc-think \
 			--driver docker-container \
 			--driver-opt network=host \
 			--config .builders/buildkitd-strix.toml \
@@ -98,13 +107,13 @@ builder-think: ## Setup Thinkstation builder (docker-container over SSH)
 			ssh://$(THINK_HOST); \
 	fi
 
-builder-gaming: ## Setup Gaming builder (docker-container over SSH)
-	@if docker buildx ls --format '{{.Name}}' | grep -qx 'gaming'; then \
-		echo "Gaming builder already exists"; \
+builder-snoc-gaming: ## Setup the snoc-gaming builder (over SSH)
+	@if docker buildx ls --format '{{.Name}}' | grep -qx 'snoc-gaming'; then \
+		echo "snoc-gaming builder already exists"; \
 	else \
-		echo "Creating Gaming builder..."; \
+		echo "Creating snoc-gaming builder..."; \
 		docker buildx create \
-			--name gaming \
+			--name snoc-gaming \
 			--driver docker-container \
 			--driver-opt network=host \
 			--config .builders/buildkitd-strix.toml \
@@ -115,39 +124,49 @@ builder-gaming: ## Setup Gaming builder (docker-container over SSH)
 	fi
 
 # One builder with all three nodes. buildx spreads independent targets
-# across nodes, so `make build-all BUILDER=pool` uses the whole fleet.
+# across nodes, so `make build-all BUILDER=snoc-pool` uses the whole fleet.
 # A single target still builds on one node — this is fan-out, not a
 # distributed compile of one image.
-builder-pool: ## Setup a 3-node pool (strix + think + gaming)
-	@if docker buildx ls --format '{{.Name}}' | grep -qx 'pool'; then \
-		echo "Pool builder already exists"; \
+builder-snoc-pool: ## Setup a 3-node pool (snoc-strix + snoc-think + snoc-gaming)
+	@if docker buildx ls --format '{{.Name}}' | grep -qx 'snoc-pool'; then \
+		echo "snoc-pool builder already exists"; \
 	else \
-		echo "Creating pool builder..."; \
-		docker buildx create --name pool --node pool-strix \
+		echo "Creating snoc-pool builder..."; \
+		docker buildx create --name snoc-pool --node snoc-strix \
 			--driver docker-container \
 			--driver-opt network=host \
 			--config .builders/buildkitd-strix.toml \
 			--platform linux/amd64; \
-		docker buildx create --name pool --append --node pool-think \
+		docker buildx create --name snoc-pool --append --node snoc-think \
 			--driver docker-container \
 			--driver-opt network=host \
 			--config .builders/buildkitd-strix.toml \
 			--platform linux/amd64 \
 			ssh://$(THINK_HOST); \
-		docker buildx create --name pool --append --node pool-gaming \
+		docker buildx create --name snoc-pool --append --node snoc-gaming \
 			--driver docker-container \
 			--driver-opt network=host \
 			--config .builders/buildkitd-strix.toml \
 			--platform linux/amd64 \
 			ssh://$(GAMING_HOST); \
 	fi
-	@docker buildx inspect pool --bootstrap
+	@docker buildx inspect snoc-pool --bootstrap
 
 builder-status: ## Show all builders and their nodes
 	@docker buildx ls
 
+# Build targets depend on this, not on builder-snoc-strix: hardcoding one
+# builder as the prerequisite meant `make push-base BUILDER=snoc-think`
+# created snoc-strix and made it the default, then built somewhere else.
+builder-ensure:
+	@docker buildx inspect $(BUILDER) > /dev/null 2>&1 || { \
+		echo "Builder '$(BUILDER)' does not exist. Create it with:"; \
+		echo "  make builder-$(BUILDER)"; \
+		exit 1; \
+	}
+
 # ─── Build Targets ───────────────────────────────────────────────
-build-base: builder-strix ## Build ROCm base image
+build-base: builder-ensure ## Build ROCm base image
 	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
@@ -157,7 +176,7 @@ build-base: builder-strix ## Build ROCm base image
 		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
 		pytorch-base
 
-build-pytorch: builder-strix ## Build PyTorch (depends on base)
+build-pytorch: builder-ensure ## Build PyTorch (depends on base)
 	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
@@ -167,7 +186,7 @@ build-pytorch: builder-strix ## Build PyTorch (depends on base)
 		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
 		pytorch
 
-build-runtime: builder-strix ## Build runtime image (depends on pytorch)
+build-runtime: builder-ensure ## Build runtime image (depends on pytorch)
 	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
@@ -177,7 +196,7 @@ build-runtime: builder-strix ## Build runtime image (depends on pytorch)
 		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
 		pytorch-run
 
-build-all: builder-strix ## Build all targets
+build-all: builder-ensure ## Build all targets
 	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
@@ -187,7 +206,7 @@ build-all: builder-strix ## Build all targets
 		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)"
 
 # ─── Push Targets ────────────────────────────────────────────────
-push-base: builder-strix ## Build and push base image
+push-base: builder-ensure ## Build and push base image
 	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
@@ -202,7 +221,7 @@ push-base: builder-strix ## Build and push base image
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
 		--push
 
-push-pytorch: builder-strix ## Build and push PyTorch
+push-pytorch: builder-ensure ## Build and push PyTorch
 	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
@@ -217,7 +236,7 @@ push-pytorch: builder-strix ## Build and push PyTorch
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
 		--push
 
-push-runtime: builder-strix ## Build and push runtime image
+push-runtime: builder-ensure ## Build and push runtime image
 	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
@@ -232,7 +251,7 @@ push-runtime: builder-strix ## Build and push runtime image
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
 		--push
 
-push-all: builder-strix ## Build and push all targets
+push-all: builder-ensure ## Build and push all targets
 	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
@@ -242,7 +261,7 @@ push-all: builder-strix ## Build and push all targets
 		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)"
 
 # ─── Test ─────────────────────────────────────────────────────────
-test: builder-strix ## Run test target
+test: builder-ensure ## Run test target
 	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \

@@ -2,7 +2,7 @@
 # build.sh - run a bake invocation and record telemetry for it.
 #
 # Usage: telemetry/build.sh [bake args...]
-#        telemetry/build.sh --builder pool pytorch
+#        telemetry/build.sh --builder snoc-pool pytorch
 #
 # Runs `docker buildx bake -f bake.hcl "$@"`, then writes Prometheus
 # metrics for every build that invocation produced: wall-clock duration,

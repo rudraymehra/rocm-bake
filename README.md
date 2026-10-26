@@ -101,7 +101,7 @@ Automated build pipeline for PyTorch with ROCm support optimized for AMD Strix H
 - Both gfx1201 (RDNA4) — they cross-compile for gfx950 fine, but cannot
   run `make test`
 - Reach Zot over the tailnet at `snoc-strix.fold-leaffish.ts.net:8080`
-- `make builder-pool` groups all three into one builder named `pool`,
+- `make builder-snoc-pool` groups all three into one builder named `pool`,
   which fans build *targets* out across nodes (it does not split a single
   image across them)
 
@@ -240,7 +240,7 @@ replacement for a bare `bake` call. The `make build-*` targets already
 route through it; set `TELEMETRY=0` for a bare bake.
 
 ```bash
-./telemetry/build.sh --builder pool pytorch
+./telemetry/build.sh --builder snoc-pool pytorch
 make build-pytorch                  # same thing, via the Makefile
 ```
 
@@ -419,7 +419,7 @@ Two different failures look similar from a build log:
   `--config .builders/buildkitd-strix.toml`.
 
 Both settings are fixed at builder-create time, so the fix is always
-`docker buildx rm <name>` then `make builder-<name>`; editing the toml
+`docker buildx rm <name>` then `make builder-<builder>`; editing the toml
 does nothing to an existing builder. Inspect with
 `docker buildx inspect <name>`. If pushes get 401, `docker login
 snoc-strix.fold-leaffish.ts.net:8080 -u ci`.
@@ -431,7 +431,7 @@ snoc-strix.fold-leaffish.ts.net:8080 -u ci`.
 docker buildx ls
 
 # Create builder if missing (--config and network=host are both required)
-make builder-strix
+make builder-snoc-strix
 ```
 
 ### Insufficient disk space
@@ -467,16 +467,16 @@ Three failure modes have distinct signatures:
 | `Cache write errors` climbing | The store is full — extstore exhausted, and evictions are disabled by design |
 
 Builder settings are fixed at create time, so after changing the
-buildkitd config: `docker buildx rm strix && make builder-strix`.
+buildkitd config: `docker buildx rm snoc-strix && make builder-snoc-strix`.
 
 ### Telemetry not collecting
 
 ```bash
 # Run a build through the wrapper directly and watch what it records
-./telemetry/build.sh --builder strix pytorch
+./telemetry/build.sh --builder snoc-strix pytorch
 
 # Is there any build history to read?
-docker buildx history ls --builder strix
+docker buildx history ls --builder snoc-strix
 ```
 
 Metrics land in `telemetry/out/` instead of the node_exporter directory

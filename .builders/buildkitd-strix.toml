@@ -1,10 +1,10 @@
 # Buildkit daemon configuration for SNOC Strix (gfx950, ROCm)
 #
-# For the docker-container driver (what `make builder-strix` does):
-#   docker buildx create --name strix --driver docker-container \
+# For the docker-container driver (what `make builder-snoc-strix` does):
+#   docker buildx create --name snoc-strix --driver docker-container \
 #     --driver-opt network=host --config .builders/buildkitd-strix.toml
 # The config is baked in at create time — an existing builder does not
-# pick up edits to this file. Recreate it: docker buildx rm strix.
+# pick up edits to this file. Recreate it: docker buildx rm snoc-strix.
 #
 # network=host is not optional. Docker strips loopback nameservers when
 # it writes a container's resolv.conf, so a bridged builder falls back to
@@ -12,7 +12,7 @@
 # then fails with "no such host" mid-build. Sharing the host netns gives
 # the builder the host's resolver, MagicDNS included.
 #
-# For standalone buildkitd on Think:
+# For standalone buildkitd on snoc-thinkstation:
 #   sudo cp buildkitd-strix.toml /etc/buildkit/buildkitd.toml
 #   sudo systemctl restart buildkitd
 #
