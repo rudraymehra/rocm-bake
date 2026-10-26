@@ -48,11 +48,12 @@ else
 BAKE = ./telemetry/build.sh
 endif
 
-.PHONY: help zot-check zot-catalog zot-tags zot-logs \
+.PHONY: help zot-check zot-catalog zot-tags zot-wheels zot-logs \
         builder-setup builder-snoc-strix builder-snoc-think builder-snoc-gaming \
         builder-snoc-pool builder-status builder-logs builder-restart \
         build-status build-logs build-inspect builder-ensure watch \
         cold-build build-aiter push-aiter aiter-wheel \
+        build-wheel push-wheel wheel \
         cache-stats cache-summary cache-check cache-logs builder-load \
         build-base build-pytorch build-runtime build-all \
         push-base push-pytorch push-runtime push-all \
@@ -97,6 +98,20 @@ zot-catalog: ## List repositories in the Zot registry
 zot-tags: ## List tags for a repo (REPO=rocm-pytorch/base)
 	@curl -sf http://$(REGISTRY)/v2/$(REPO)/tags/list 2>/dev/null | python3 -m json.tool 2>/dev/null \
 		|| echo "No such repository in $(REGISTRY): $(REPO)"
+
+# Wheel artifacts are plain images whose only payload is /wheels, so
+# they show up in the catalog like anything else — this filters to them.
+WHEEL_REPOS ?= pytorch-wheel aiter
+zot-wheels: ## List wheel artifacts published to Zot
+	@for r in $(WHEEL_REPOS); do \
+		tags=$$(curl -sf "http://$(REGISTRY)/v2/$(REGISTRY_NAME)/$$r/tags/list" 2>/dev/null \
+			| python3 -c "import json,sys; print(' '.join(sorted(json.load(sys.stdin)['tags'])))" 2>/dev/null); \
+		if [ -n "$$tags" ]; then \
+			printf '  %-16s %s\n' "$$r" "$$tags"; \
+		else \
+			printf '  %-16s (not published)\n' "$$r"; \
+		fi; \
+	done
 
 zot-logs: ## Follow Zot registry logs
 	@sudo journalctl -u zot -f
@@ -152,13 +167,16 @@ cache-summary: ## One-line cache state plus deltas since the last call
 			printf "items=%d  ram=%.2f/%.0fGB  disk_pages=%d  evict=%d\n", \
 				i, b/1073741824, l/1073741824, x, e; \
 			if (dg+dw == 0) { \
-				printf "idle  (no cache traffic since last refresh)\n"; \
+				printf "interval  idle (no cache traffic since last refresh)\n"; \
 			} else if (dg < dw/10) { \
-				printf "+%d writes  +%d reads  WRITE-ONLY — sccache is not reading (SCCACHE_RECACHE set?)\n", dw, dg; \
+				printf "interval  +%d writes  +%d reads  WRITE-ONLY — sccache is not reading\n", dw, dg; \
 			} else { \
-				printf "+%d writes  +%d reads  hit=%.0f%% this interval\n", \
+				printf "interval  +%d writes  +%d reads  hit=%.0f%%\n", \
 					dw, dg, (dg>0 ? 100*dh/dg : 0); \
-			} }'; \
+			} \
+			if (g > 0) \
+				printf "lifetime  %d writes  %d reads  hit=%.0f%%\n", w, g, 100*h/g; \
+			}'; \
 		mv $(CACHE_STATE).now $(CACHE_STATE); \
 	fi
 
@@ -316,18 +334,23 @@ watch: ## Live build history across all snoc-* builders (WATCH_BUILDERS=, WATCH_
 			[ -n "$$out" ] || continue; \
 			echo "══ $$b"; \
 			echo "$$out"; \
-			running=$$(docker buildx history ls --builder $$b \
-				--filter status=running --format "{{.Ref}}" 2>/dev/null); \
-			[ -n "$$running" ] && $(MAKE_BIN) --no-print-directory builder-load BUILDER=$$b; \
-			for id in $$running; do \
-				echo; echo "──── $$b / $$id ────"; \
+			if docker buildx history ls --builder $$b --filter status=running \
+					--format "{{.Ref}}" 2>/dev/null | grep -q .; then \
+				$(MAKE_BIN) --no-print-directory builder-load BUILDER=$$b; \
+			fi; \
+			echo; \
+		done; \
+		for b in $(WATCH_BUILDERS); do \
+			for id in $$(docker buildx history ls --builder $$b \
+					--filter status=running --format "{{.Ref}}" 2>/dev/null); do \
+				echo "──── $$b / $$id ────"; \
 				timeout 3 docker buildx history logs "$$id" --builder $$b \
 					> $(WATCH_TMP) 2>&1 || true; \
 				grep -v "^$$" $(WATCH_TMP) \
 					| grep -v "rpc error: code = Canceled" \
 					| tail -$(WATCH_LINES); \
+				echo; \
 			done; \
-			echo; \
 		done'
 
 
@@ -463,6 +486,22 @@ push-runtime: builder-ensure ## Build and push runtime image
 push-all: builder-ensure ## Build and push all targets
 	$(call bake,,--push)
 
+##@ Wheels
+
+push-wheel: builder-ensure ## Build and push the torch wheel image to Zot
+	$(call bake,pytorch-wheel,--push)
+
+build-wheel: builder-ensure ## Build the torch wheel image locally
+	$(call bake,pytorch-wheel)
+
+# The wheel lives in an image; this pulls it back onto local disk.
+wheel: ## Extract the torch wheel from Zot into ./dist
+	@mkdir -p dist
+	@printf 'FROM %s/%s/pytorch-wheel:latest\n' "$(REGISTRY)" "$(REGISTRY_NAME)" \
+		| docker buildx build --builder $(BUILDER) \
+			--output type=local,dest=dist -
+	@ls -la dist/wheels/
+
 ##@ AITER
 
 build-aiter: builder-ensure ## Build the AITER wheel (needs pytorch pushed first)
@@ -474,9 +513,9 @@ push-aiter: builder-ensure ## Build and push the AITER wheel image
 # The wheel lives in an image; this is how you get it onto local disk.
 aiter-wheel: ## Extract the AITER wheel from the registry into ./dist
 	@mkdir -p dist
-	@docker buildx build --builder $(BUILDER) \
-		--output type=local,dest=dist \
-		- <<< "FROM $(REGISTRY)/$(REGISTRY_NAME)/aiter:latest"
+	@printf 'FROM %s/%s/aiter:latest\n' "$(REGISTRY)" "$(REGISTRY_NAME)" \
+		| docker buildx build --builder $(BUILDER) \
+			--output type=local,dest=dist -
 	@ls -la dist/wheels/
 
 # ─── Test ─────────────────────────────────────────────────────────

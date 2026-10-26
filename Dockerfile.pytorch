@@ -252,3 +252,18 @@ ENV HSA_OVERRIDE_GFX_VERSION=11.0.2
 CMD ["python", "-c", "import torch; print(f'PyTorch {torch.__version__} HIP:{torch.version.hip}'); print(f'Devices: {torch.cuda.device_count() if torch.cuda.is_available() else 0}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}'); import sys; sys.exit(0 if torch.cuda.is_available() else 1)"]
 
 ENTRYPOINT ["python"]
+
+# ─── Wheel-only image ────────────────────────────────────────────
+# The final image installs the wheel into /opt/venv and then deletes
+# it, so the artifact that took half an hour to produce cannot be
+# recovered from it. This stage publishes the wheel itself: a scratch
+# image carrying nothing but /wheels, which buildx can push to Zot and
+# `COPY --from=` can consume, with no extra artifact store.
+#
+# Build it with `--target wheel` (bake target: pytorch-wheel). The
+# builder stage is shared, so with a warm layer cache this costs a
+# copy rather than a rebuild.
+FROM scratch AS wheel
+
+COPY --from=builder /opt/pytorch/dist/ /wheels/
+COPY --from=builder /opt/pytorch/build.log /opt/pytorch/sccache-stats.txt /

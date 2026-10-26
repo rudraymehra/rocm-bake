@@ -175,6 +175,10 @@ target "pytorch-base" {
 target "pytorch" {
   inherits = ["pytorch-base"]
   dockerfile = "Dockerfile.pytorch"
+  # Explicit: without it buildkit builds the LAST stage in the file, so
+  # appending the wheel stage silently made this target publish a
+  # scratch image with no shell.
+  target     = "final"
   tags = compact([
     "${REGISTRY}/${REGISTRY_NAME}/pytorch:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}",
     "${REGISTRY}/${REGISTRY_NAME}/pytorch:latest",
@@ -217,6 +221,27 @@ target "pytorch" {
   }
 
   output = ["type=image,compression=zstd"]
+}
+
+# ─── PyTorch wheel artifact ──────────────────────────────────────
+# Same idea as the aiter target: the wheel as its own image so it can
+# live in Zot and be pulled without rebuilding PyTorch.
+target "pytorch-wheel" {
+  inherits   = ["pytorch"]
+  target     = "wheel"
+  dockerfile = "Dockerfile.pytorch"
+
+  tags = compact([
+    "${REGISTRY}/${REGISTRY_NAME}/pytorch-wheel:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}",
+    "${REGISTRY}/${REGISTRY_NAME}/pytorch-wheel:latest",
+    VCS_REF != "" ? "${REGISTRY}/${REGISTRY_NAME}/pytorch-wheel:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}-g${VCS_REF}" : "",
+  ])
+
+  labels = merge(OCI_LABELS, {
+    "org.opencontainers.image.title"       = "rocm-pytorch wheel"
+    "org.opencontainers.image.description" = "torch wheel for ${PYTORCH_ROCM_ARCH}, ROCm ${ROCM_VERSION}"
+    "org.opencontainers.image.version"     = "${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}"
+  })
 }
 
 # ─── AITER wheel ─────────────────────────────────────────────────
@@ -291,8 +316,8 @@ target "pytorch-test" {
   inherits = ["pytorch"]
   tags     = ["${REGISTRY}/${REGISTRY_NAME}/pytorch:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}-test"]
 
-  # Run the test stage in Dockerfile.pytorch
-  run-target = "test"
+  # run-target is not a bake attribute; target selects the stage.
+  target = "test"
 }
 
 # ─── Builders ────────────────────────────────────────────────────

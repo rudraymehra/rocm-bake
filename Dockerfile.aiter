@@ -48,10 +48,19 @@ RUN git clone --depth 1 --branch ${AITER_REF} --recurse-submodules \
 
 WORKDIR /opt/aiter
 
-# flydsl is declared in AITER's [build-system].requires, which is also
-# the whole story on "FlyDSL": it is a PyPI build dependency of AITER,
-# not a PyTorch build option.
+# --no-isolation means pip will NOT fetch the build backend's own
+# dependencies, so everything in [build-system].requires has to be
+# installed first. Read them out of pyproject.toml rather than hardcoding:
+# the list differs between AITER releases (v0.1.27 adds vcs_versioning on
+# top of main's setuptools_scm, pybind11, ninja, pandas, flydsl...).
+#
+# flydsl appears in that list, which is also the whole story on "FlyDSL":
+# it is a PyPI build dependency of AITER, not a PyTorch build option.
 RUN pip install --no-cache-dir build && \
+    python -c "import tomllib; print(chr(10).join(tomllib.load(open('pyproject.toml','rb'))['build-system']['requires']))" \
+        > /tmp/build-reqs.txt && \
+    echo "--- AITER build-system requires ---" && cat /tmp/build-reqs.txt && \
+    pip install --no-cache-dir -r /tmp/build-reqs.txt && \
     pip install --no-cache-dir -r requirements.txt
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
