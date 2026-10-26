@@ -9,6 +9,7 @@ REGISTRY_NAME ?= rocm-pytorch
 PYTORCH_VERSION ?= 2.14.1
 ROCM_VERSION ?= 10.1.0-full
 PYTHON_VERSION ?= 3.14
+PYTORCH_ROCM_ARCH ?= gfx950
 BUILDER ?= snoc-strix
 REPO ?= $(REGISTRY_NAME)/base
 
@@ -17,6 +18,15 @@ REPO ?= $(REGISTRY_NAME)/base
 # *containers* lack MagicDNS). Note the builder is named snoc-think but
 # the machine is snoc-thinkstation — there is no snoc-think on the
 # tailnet, so this variable keeps the real hostname.
+# Shared compiler-cache store (memcached + extstore) on Strix.
+# Aliased so the recipe text does not contain the literal $(MAKE):
+# make executes any line referencing $(MAKE) even under -n, which made
+# `make -n watch` launch a full-screen watch instead of printing it.
+MAKE_BIN := $(MAKE)
+
+MEMCACHED_HOST ?= snoc-strix.fold-leaffish.ts.net
+MEMCACHED_PORT ?= 11211
+
 THINK_HOST ?= snoc-thinkstation
 GAMING_HOST ?= snoc-gaming
 
@@ -43,15 +53,23 @@ endif
         builder-snoc-pool builder-status builder-logs builder-restart \
         build-status build-logs build-inspect builder-ensure watch \
         cold-build build-aiter push-aiter aiter-wheel \
+        cache-stats cache-check cache-logs builder-load \
         build-base build-pytorch build-runtime build-all \
         push-base push-pytorch push-runtime push-all \
         clean clean-cache test \
         validate bake-plan setup
 
 help: ## Show this help
-	@awk 'BEGIN {FS = ":.*?## "} \
-		/^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5); next } \
-		/^[a-zA-Z_-]+:.*?## / { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }' \
+	@printf '\n\033[1mROCm PyTorch Build\033[0m — PyTorch %s on ROCm %s for %s\n' \
+		"$(PYTORCH_VERSION)" "$(ROCM_VERSION)" "$(PYTORCH_ROCM_ARCH)"
+	@printf 'Registry %s · builder %s\n' "$(REGISTRY)" "$(BUILDER)"
+	@printf 'Usage: make <target> [VAR=value]\n'
+	@awk 'BEGIN {FS = ":.*?## "; cmd = "sort"} \
+		/^##@/ { if (insec) close(cmd); printf "\n\033[1m%s\033[0m\n", substr($$0, 5); insec = 1; next } \
+		/^[a-zA-Z_-]+:.*?## / { \
+			line = sprintf("  \033[36m%-20s\033[0m %s", $$1, $$2); \
+			if (insec) print line | cmd; else print line } \
+		END { if (insec) close(cmd) }' \
 		$(MAKEFILE_LIST)
 	@printf '\nCommon variables: BUILDER (default %s), REGISTRY, PYTORCH_VERSION,\n' "$(BUILDER)"
 	@printf 'ROCM_VERSION, PYTHON_VERSION, TELEMETRY=0 to skip metrics.\n'
@@ -60,7 +78,7 @@ help: ## Show this help
 # zot runs as a bare-metal systemd service on Strix, deployed and owned
 # outside this repo. These targets inspect it; they never start or stop
 # it, because other services on the fleet pull through the same registry.
-##@ Registry (Zot)
+##@ OCI Registry (Zot)
 
 zot-check: ## Verify the Zot registry is reachable
 	@systemctl is-active --quiet zot \
@@ -84,6 +102,36 @@ zot-logs: ## Follow Zot registry logs
 	@sudo journalctl -u zot -f
 
 # ─── Buildx Builder Setup ────────────────────────────────────────
+##@ Compiler Cache
+
+# The sccache store every node shares. `stats` is a memcached verb, not
+# something sccache can report: the sccache server lives and dies with
+# the build container, so the store itself is the only durable view.
+cache-stats: ## Show the shared compiler-cache (memcached) state
+	@printf 'stats\r\nquit\r\n' | timeout 5 nc $(MEMCACHED_HOST) $(MEMCACHED_PORT) 2>/dev/null \
+		| grep -E '^STAT (cmd_get|cmd_set|get_hits|get_misses|curr_items|total_items|bytes|limit_maxbytes|evictions|expired_unfetched|extstore_pages_used|extstore_pages_free|extstore_bytes_written|extstore_page_evictions) ' \
+		| tr -d '\r' | sed 's/^STAT /  /' \
+		|| { echo "No memcached at $(MEMCACHED_HOST):$(MEMCACHED_PORT)"; exit 1; }
+	@printf 'stats\r\nquit\r\n' | timeout 5 nc $(MEMCACHED_HOST) $(MEMCACHED_PORT) 2>/dev/null \
+		| awk -F'[ \r]' '/^STAT get_hits/{h=$$3} /^STAT get_misses/{m=$$3} \
+			/^STAT bytes /{b=$$3} /^STAT limit_maxbytes/{l=$$3} \
+			END { if (h+m > 0) printf "  hit_rate            %.1f%%\n", 100*h/(h+m); \
+			      if (l > 0) printf "  ram_tier_used       %.1f%% of %.0fGB\n", 100*b/l, l/1073741824 }'
+
+cache-check: ## Verify every build node can reach the compiler cache
+	@for h in localhost $(THINK_HOST) $(GAMING_HOST); do \
+		printf '  %-20s ' "$$h"; \
+		if [ "$$h" = localhost ]; then \
+			printf 'version\r\nquit\r\n' | timeout 5 nc $(MEMCACHED_HOST) $(MEMCACHED_PORT) 2>/dev/null | head -1 | tr -d '\r'; \
+		else \
+			ssh -o BatchMode=yes "$$h" "printf 'version\r\nquit\r\n' | timeout 5 nc $(MEMCACHED_HOST) $(MEMCACHED_PORT) 2>/dev/null | head -1" 2>/dev/null | tr -d '\r'; \
+		fi; \
+		echo; \
+	done
+
+cache-logs: ## Follow the memcached service log
+	@sudo journalctl -u memcached -f
+
 ##@ Builders
 
 builder-setup: builder-snoc-strix builder-snoc-think builder-snoc-gaming ## Setup all builders
@@ -214,13 +262,29 @@ WATCH_BUILDERS ?= $(shell docker buildx ls 2>/dev/null | awk 'NR>1 && /^[^ ]/ {g
 watch: ## Live build history across all snoc-* builders (WATCH_BUILDERS=, WATCH_LINES=)
 	@command -v watch > /dev/null || { echo "watch(1) not found: apt-get install procps"; exit 1; }
 	@watch -n $(WATCH_INTERVAL) -t --color ' \
+		printf "stats\\r\\nquit\\r\\n" \
+			| timeout 2 nc $(MEMCACHED_HOST) $(MEMCACHED_PORT) 2>/dev/null \
+			| awk -F"[ \r]" " \
+				/^STAT get_hits/{h=\$$3} /^STAT get_misses/{m=\$$3} \
+				/^STAT cmd_set/{w=\$$3} /^STAT curr_items/{i=\$$3} \
+				/^STAT bytes /{b=\$$3} /^STAT limit_maxbytes/{l=\$$3} \
+				/^STAT evictions/{e=\$$3} /^STAT extstore_pages_used/{x=\$$3} \
+				END { \
+					r = (h+m > 0) ? sprintf(\"%.0f%%\", 100*h/(h+m)) : \"n/a\"; \
+					printf \"══ sccache store\\n\"; \
+					printf \"items=%s  writes=%s  hit=%s  ram=%.1f/%.0fGB  disk_pages=%s  evict=%s\\n\", \
+						i, w, r, b/1073741824, l/1073741824, x, e }" \
+			|| echo "══ sccache store unreachable at $(MEMCACHED_HOST):$(MEMCACHED_PORT)"; \
+		echo; \
 		for b in $(WATCH_BUILDERS); do \
 			out=$$(docker buildx history ls --builder $$b 2>/dev/null | tail -n +2); \
 			[ -n "$$out" ] || continue; \
 			echo "══ $$b"; \
 			echo "$$out"; \
-			for id in $$(docker buildx history ls --builder $$b \
-					--filter status=running --format "{{.Ref}}" 2>/dev/null); do \
+			running=$$(docker buildx history ls --builder $$b \
+				--filter status=running --format "{{.Ref}}" 2>/dev/null); \
+			[ -n "$$running" ] && $(MAKE_BIN) --no-print-directory builder-load BUILDER=$$b; \
+			for id in $$running; do \
 				echo; echo "──── $$b / $$id ────"; \
 				timeout 3 docker buildx history logs "$$id" --builder $$b \
 					> $(WATCH_TMP) 2>&1 || true; \
@@ -252,6 +316,25 @@ builder-restart: ## Restart buildkitd for $(BUILDER), clearing stuck builds
 			esac; \
 		done
 	@echo "done"
+
+# Per-node load. Kept as its own target so `watch` can re-enter make
+# rather than inlining a second layer of quoting inside its shell string.
+builder-load: ## Show CPU, cores and load for each node of $(BUILDER)
+	@docker buildx inspect $(BUILDER) 2>/dev/null \
+		| awk '/^Name:[[:space:]]+[^[:space:]]/ {n=$$2} /^Endpoint:/ {print n, $$2}' \
+		| while read node endpoint; do \
+			case "$$endpoint" in \
+				ssh://*) stats=$$(timeout 6 ssh -o BatchMode=yes "$${endpoint#ssh://}" \
+					"docker stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}' buildx_buildkit_$$node 2>/dev/null; nproc; uptime" 2>/dev/null) ;; \
+				*) stats=$$(docker stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}' "buildx_buildkit_$$node" 2>/dev/null; nproc; uptime) ;; \
+			esac; \
+			cpu=$$(echo "$$stats" | sed -n 1p | cut -d'|' -f1); \
+			mem=$$(echo "$$stats" | sed -n 1p | cut -d'|' -f2); \
+			cores=$$(echo "$$stats" | sed -n 2p); \
+			load=$$(echo "$$stats" | sed -n 3p | sed 's/.*load average: //'); \
+			printf '   %-14s cpu=%-9s of %s cores   mem=%-22s load=%s\n' \
+				"$$node" "$${cpu:-?}" "$${cores:-?}" "$${mem:-?}" "$${load:-?}"; \
+		done
 
 build-status: ## List build records for $(BUILDER)
 	@docker buildx history ls --builder $(BUILDER)
@@ -299,6 +382,7 @@ define bake
 	--set "*.args.PYTORCH_VERSION=$(PYTORCH_VERSION)" \
 	--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
 	--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
+	--set "*.args.PYTORCH_ROCM_ARCH=$(PYTORCH_ROCM_ARCH)" \
 	$(2) $(1)
 endef
 
