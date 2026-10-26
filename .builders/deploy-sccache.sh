@@ -1,6 +1,6 @@
 #!/bin/bash
 # deploy-sccache.sh - Deploy sccache server on SNOC Strix or Think build machines
-# Usage: ./deploy-sccache.sh [strix|think] [version]
+# Usage: ./deploy-sccache.sh [strix|think] [version] [cache-size] [port]
 #
 # This script:
 #   1. Downloads the sccache binary from Mozilla releases
@@ -10,20 +10,23 @@
 #   5. Starts the sccache server
 #
 # Examples:
-#   ./deploy-sccache.sh strix          # Deploy on Strix (default, 200G cache)
-#   ./deploy-sccache.sh think 0.7.7   # Deploy on Think with specific version
-#   ./deploy-sccache.sh strix 200     # Deploy on Strix with custom cache size
+#   ./deploy-sccache.sh strix                   # Strix, defaults (0.7.7, 200G, port 4226)
+#   ./deploy-sccache.sh think 0.7.7             # Think with a specific version
+#   ./deploy-sccache.sh strix 0.7.7 500G 4226   # custom cache size and port
 
 set -euo pipefail
 
 MACHINE="${1:-strix}"
 VERSION="${2:-0.7.7}"
 CACHE_SIZE="${3:-200G}"
+# sccache's own default. Port 9000 is taken by lemond/tailscaled on Strix.
+SERVER_PORT="${4:-4226}"
 TARGET_DIR="/usr/local/bin"
 
 echo "=== sccache Deployer for ${MACHINE^^} ==="
 echo "Version: ${VERSION}"
 echo "Cache Size: ${CACHE_SIZE}"
+echo "Port: ${SERVER_PORT}"
 echo "Machine: ${MACHINE}"
 
 # Check if running as root
@@ -66,22 +69,30 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=forking
+Type=simple
 User=root
 Group=root
 
-# Start the server
-ExecStartPre=-${TARGET_DIR}/sccache --stop-server
-ExecStart=${TARGET_DIR}/sccache --start-server \
-    --cache-size=${CACHE_SIZE}
+# sccache has no CLI flags for cache size, directory or logging — all
+# configuration is via the environment.
+Environment=SCCACHE_DIR=/var/cache/sccache
+Environment=SCCACHE_CACHE_SIZE=${CACHE_SIZE}
+Environment=SCCACHE_SERVER_PORT=${SERVER_PORT}
+Environment=SCCACHE_ERROR_LOG=/var/log/sccache/sccache.log
+Environment=SCCACHE_LOG=info
+# Without this the server exits after 10 minutes idle and systemd restarts it
+Environment=SCCACHE_IDLE_TIMEOUT=0
+# Run the server in the foreground so systemd can supervise it. These two
+# reject any other sccache subcommand, so there can be no ExecStartPre
+# --stop-server here; systemd owns the process lifecycle instead.
+Environment=SCCACHE_START_SERVER=1
+Environment=SCCACHE_NO_DAEMON=1
+
+ExecStart=${TARGET_DIR}/sccache
 
 # Restart on failure
 Restart=on-failure
 RestartSec=5
-
-# sccache doesn't fork in 0.7.7+
-Type=simple
-NotifyAccess=main
 
 # Resource limits
 MemoryMax=4G
@@ -111,7 +122,7 @@ sleep 3
 if systemctl is-active --quiet sccache; then
     echo "✅ sccache server is running on ${MACHINE}"
     echo "📊 Cache stats:"
-    ${TARGET_DIR}/sccache --show-stats
+    SCCACHE_SERVER_PORT="${SERVER_PORT}" ${TARGET_DIR}/sccache --show-stats
 else
     echo "❌ sccache failed to start. Check logs:"
     echo "   journalctl -u sccache.service -n 50"
@@ -121,12 +132,12 @@ fi
 
 echo ""
 echo "=== Deployment Complete ==="
-echo "Server is running on port 9000"
+echo "Server is running on port ${SERVER_PORT}"
 echo "Cache directory: /var/cache/sccache (${CACHE_SIZE})"
 echo "Logs: /var/log/sccache/sccache.log"
 echo ""
 echo "To verify from a build machine:"
-echo "  SCCACHE_ADDR=localhost:9000 sccache --show-stats"
+echo "  SCCACHE_SERVER_PORT=${SERVER_PORT} sccache --show-stats"
 echo ""
 echo "To deploy from remote:"
-echo "  ssh root@${MACHINE} './deploy-sccache.sh ${MACHINE} ${VERSION} ${CACHE_SIZE}'"
+echo "  ssh root@${MACHINE} './deploy-sccache.sh ${MACHINE} ${VERSION} ${CACHE_SIZE} ${SERVER_PORT}'"

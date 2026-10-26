@@ -28,7 +28,7 @@ variable "REGISTRY_NAME" {
 }
 
 variable "PYTORCH_VERSION" {
-  default = "2.14.0"
+  default = "2.14.1"
 }
 
 variable "ROCM_VERSION" {
