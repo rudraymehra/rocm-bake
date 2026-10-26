@@ -13,10 +13,11 @@
 # all read and write objects here. An object compiled on Strix is a hit
 # on thinkstation and gaming.
 #
-# memcached rather than redis because of extstore: above the RAM ceiling
-# item data goes to a file on disk, with only keys and pointers kept in
-# memory. Redis has no equivalent in the open-source build — maxmemory
-# is a hard ceiling, and AOF is persistence, not tiering.
+# memcached is chosen for extstore: above the RAM ceiling item data goes
+# to a file on disk, with only keys and pointers kept in memory. That
+# tiering is the whole point — a PyTorch object cache outgrows any
+# sensible RAM budget, and the alternative stores sccache supports
+# either cap hard at memory size or need a separate object server.
 
 set -euo pipefail
 
@@ -32,12 +33,6 @@ echo "Disk tier:   ${EXT_PATH} (${DISK_SIZE})"
 if [[ $EUID -ne 0 ]]; then
    echo "❌ This script must be run as root (sudo)"
    exit 1
-fi
-
-# The containerised redis held the previous incarnation of this cache.
-if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'sccache-redis'; then
-    echo "🛑 Removing the superseded sccache-redis container..."
-    docker rm -f sccache-redis > /dev/null
 fi
 
 echo "📦 Installing memcached..."

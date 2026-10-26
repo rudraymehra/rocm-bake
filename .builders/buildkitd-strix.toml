@@ -23,7 +23,7 @@
 # RUN steps do NOT inherit the builder container's resolver — buildkit
 # writes its own /etc/resolv.conf for the build sandbox, defaulting to
 # 8.8.8.8. Without this block a build step cannot resolve any tailnet
-# name, so both the registry and the shared sccache Redis fail from
+# name, so both the registry and the shared sccache store fail from
 # inside a build even though the node itself resolves them fine.
 # The public resolver second is load-bearing, not belt-and-braces: this
 # tailnet has no global nameservers, so MagicDNS SERVFAILs on anything
