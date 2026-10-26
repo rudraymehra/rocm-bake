@@ -20,6 +20,21 @@
 # not inert: a containerd worker pointed at a bad address takes the whole
 # daemon down in a 60-second restart loop.
 
+# RUN steps do NOT inherit the builder container's resolver — buildkit
+# writes its own /etc/resolv.conf for the build sandbox, defaulting to
+# 8.8.8.8. Without this block a build step cannot resolve any tailnet
+# name, so both the registry and the shared sccache Redis fail from
+# inside a build even though the node itself resolves them fine.
+# The public resolver second is load-bearing, not belt-and-braces: this
+# tailnet has no global nameservers, so MagicDNS SERVFAILs on anything
+# outside it. With 100.100.100.100 alone a build step resolves tailnet
+# names and nothing else — apt, pip and the pytorch clone all fail. The
+# resolver falls through to the next entry on SERVFAIL, so tailnet names
+# come from MagicDNS and the rest from upstream.
+[dns]
+  nameservers = ["100.100.100.100", "64.59.135.135", "8.8.8.8"]
+  searchDomains = ["fold-leaffish.ts.net"]
+
 [worker.oci]
   enabled = true
   platforms = ["linux/amd64"]

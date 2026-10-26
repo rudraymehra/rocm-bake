@@ -18,6 +18,16 @@ BUILDER ?= strix
 THINK_HOST ?= snoc-thinkstation
 GAMING_HOST ?= snoc-gaming
 
+# Every build goes through the telemetry wrapper: it runs the bake, then
+# records duration, layer-cache hit ratio and sccache counters, and exits
+# with the bake's own status. TELEMETRY=0 for a bare bake.
+TELEMETRY ?= 1
+ifeq ($(TELEMETRY),0)
+BAKE = docker buildx bake -f bake.hcl
+else
+BAKE = ./telemetry/build.sh
+endif
+
 .PHONY: help zot-check zot-catalog zot-logs \
         builder-setup builder-strix builder-think builder-gaming \
         builder-pool builder-status \
@@ -138,7 +148,7 @@ builder-status: ## Show all builders and their nodes
 
 # ─── Build Targets ───────────────────────────────────────────────
 build-base: builder-strix ## Build ROCm base image
-	@docker buildx bake -f bake.hcl \
+	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
@@ -148,7 +158,7 @@ build-base: builder-strix ## Build ROCm base image
 		pytorch-base
 
 build-pytorch: builder-strix ## Build PyTorch (depends on base)
-	@docker buildx bake -f bake.hcl \
+	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
@@ -158,7 +168,7 @@ build-pytorch: builder-strix ## Build PyTorch (depends on base)
 		pytorch
 
 build-runtime: builder-strix ## Build runtime image (depends on pytorch)
-	@docker buildx bake -f bake.hcl \
+	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
@@ -168,7 +178,7 @@ build-runtime: builder-strix ## Build runtime image (depends on pytorch)
 		pytorch-run
 
 build-all: builder-strix ## Build all targets
-	@docker buildx bake -f bake.hcl \
+	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
@@ -178,7 +188,7 @@ build-all: builder-strix ## Build all targets
 
 # ─── Push Targets ────────────────────────────────────────────────
 push-base: builder-strix ## Build and push base image
-	@docker buildx bake -f bake.hcl \
+	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
@@ -186,14 +196,14 @@ push-base: builder-strix ## Build and push base image
 		--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
 		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
 		pytorch-base
-	@docker buildx bake -f bake.hcl \
+	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
 		--push
 
 push-pytorch: builder-strix ## Build and push PyTorch
-	@docker buildx bake -f bake.hcl \
+	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
@@ -201,14 +211,14 @@ push-pytorch: builder-strix ## Build and push PyTorch
 		--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
 		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
 		pytorch
-	@docker buildx bake -f bake.hcl \
+	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
 		--push
 
 push-runtime: builder-strix ## Build and push runtime image
-	@docker buildx bake -f bake.hcl \
+	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
@@ -216,14 +226,14 @@ push-runtime: builder-strix ## Build and push runtime image
 		--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
 		--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
 		pytorch-run
-	@docker buildx bake -f bake.hcl \
+	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
 		--push
 
 push-all: builder-strix ## Build and push all targets
-	@docker buildx bake -f bake.hcl \
+	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
@@ -233,7 +243,7 @@ push-all: builder-strix ## Build and push all targets
 
 # ─── Test ─────────────────────────────────────────────────────────
 test: builder-strix ## Run test target
-	@docker buildx bake -f bake.hcl \
+	@$(BAKE) \
 		--builder $(BUILDER) \
 		--set "*.args.REGISTRY=$(REGISTRY)" \
 		--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \

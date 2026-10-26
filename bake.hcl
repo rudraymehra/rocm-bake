@@ -64,6 +64,26 @@ variable "GIT_REF" {
   default = ""
 }
 
+# Shared compiler cache on Strix, reachable from every build node. The
+# name resolves inside a build only because the buildkitd config sets
+# [dns] for the build sandbox; see .builders/buildkitd-strix.toml.
+variable "SCCACHE_MEMCACHED" {
+  default = "tcp://snoc-strix.fold-leaffish.ts.net:11211"
+}
+
+# Port for the sccache server started inside the build container. Must
+# not collide with the node's own sccache.service (4226), because
+# builders run with --driver-opt network=host.
+variable "SCCACHE_SERVER_PORT" {
+  default = "4250"
+}
+
+# 1 = refuse to start a PyTorch compile with no sccache server, rather
+# than spending an hour rebuilding everything uncached.
+variable "REQUIRE_SCCACHE" {
+  default = "1"
+}
+
 # ─── Shared build attributes ─────────────────────────────────────
 group "default" {
   targets = ["pytorch-base", "pytorch", "pytorch-run", "pytorch-test"]
@@ -120,14 +140,16 @@ target "pytorch" {
     USE_FLYDSL           = USE_FLYDSL
     USE_FLASH_ATTENTION  = USE_FLASH_ATTENTION
     GIT_REF              = GIT_REF
-  }
 
-  env = [
-    "SCCACHE_ADDR=localhost:9000",
-    "CMAKE_C_COMPILER_LAUNCHER=sccache",
-    "CMAKE_CXX_COMPILER_LAUNCHER=sccache",
-    "CMAKE_HIP_COMPILER_LAUNCHER=sccache",
-  ]
+    # The compiler-cache settings are build ARGs, not env. A bake target
+    # has no `env` attribute — the block that used to sit here was parsed
+    # as nothing, which is why no build was ever compiler-cached. The
+    # CMAKE_*_COMPILER_LAUNCHER values live in Dockerfile.pytorch; only
+    # the port and the strictness toggle are worth overriding here.
+    SCCACHE_MEMCACHED    = SCCACHE_MEMCACHED
+    SCCACHE_SERVER_PORT  = SCCACHE_SERVER_PORT
+    REQUIRE_SCCACHE      = REQUIRE_SCCACHE
+  }
 
   output = ["type=image", "compression=zstd"]
 }
