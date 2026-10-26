@@ -138,12 +138,24 @@ variable "REQUIRE_SCCACHE" {
 }
 
 # ─── Shared build attributes ─────────────────────────────────────
+# pytorch-test is deliberately absent. Its stage exits 1 when
+# torch.cuda.is_available() is false, and a buildkit RUN step has no
+# /dev/kfd — the same reason the build logs "no ROCm-capable device is
+# detected". It is a verification step for a finished image on a real
+# GPU (`make test` on snoc-strix), not something that can run inside the
+# build graph, and including it here made build-all and push-all fail at
+# the last target every time.
 group "default" {
-  targets = ["pytorch-base", "pytorch", "pytorch-run", "pytorch-test"]
+  targets = [
+    "pytorch-base", "pytorch", "pytorch-run",
+    "pytorch-wheel", "triton-wheel", "aiter-wheel",
+  ]
 }
 
-group "all" {
-  targets = ["pytorch-base", "pytorch", "pytorch-run", "pytorch-test"]
+# The wheel artifacts. Separate because each builds FROM an image that
+# must already be published, so they cannot run from a cold registry.
+group "wheels" {
+  targets = ["pytorch-wheel", "triton-wheel", "aiter-wheel"]
 }
 
 # Shared cache config for all targets
@@ -256,7 +268,7 @@ target "pytorch-wheel" {
 # Builds FROM the ROCm base, not from pytorch: triton needs cmake<4
 # while PyTorch pulls cmake 4.x, so they cannot share an environment.
 # That also means it can build in parallel with pytorch on another node.
-target "triton" {
+target "triton-wheel" {
   dockerfile = "Dockerfile.triton"
   platforms  = ["linux/amd64"]
   target     = "wheel"
@@ -273,8 +285,8 @@ target "triton" {
     "org.opencontainers.image.version"     = "${ROCM_VERSION}-${ARCH_TAG}"
   })
 
-  cache-from = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/triton-cache:latest,mode=max,registry.insecure=true"]
-  cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/triton-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
+  cache-from = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/triton-wheel-cache:latest,mode=max,registry.insecure=true"]
+  cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/triton-wheel-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
 
   args = {
     BASE_IMAGE          = "${REGISTRY}/${REGISTRY_NAME}/base:${ROCM_VERSION}-${PYTHON_VERSION}"
@@ -293,14 +305,14 @@ target "triton" {
 # Not part of the default group: it builds FROM the pytorch image, so it
 # only makes sense once that has been pushed. Build it explicitly, and
 # on whichever node is free — it is independent of the runtime image.
-target "aiter" {
+target "aiter-wheel" {
   dockerfile = "Dockerfile.aiter"
   platforms  = ["linux/amd64"]
 
   tags = compact([
-    "${REGISTRY}/${REGISTRY_NAME}/aiter:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}",
-    "${REGISTRY}/${REGISTRY_NAME}/aiter:latest",
-    VCS_REF != "" ? "${REGISTRY}/${REGISTRY_NAME}/aiter:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}-g${VCS_REF}" : "",
+    "${REGISTRY}/${REGISTRY_NAME}/aiter-wheel:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}",
+    "${REGISTRY}/${REGISTRY_NAME}/aiter-wheel:latest",
+    VCS_REF != "" ? "${REGISTRY}/${REGISTRY_NAME}/aiter-wheel:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}-g${VCS_REF}" : "",
   ])
 
   labels = merge(OCI_LABELS, {
@@ -309,12 +321,21 @@ target "aiter" {
     "org.opencontainers.image.version"     = "${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}"
   })
 
-  cache-from = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/aiter-cache:latest,mode=max,registry.insecure=true"]
-  cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/aiter-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
+  cache-from = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/aiter-wheel-cache:latest,mode=max,registry.insecure=true"]
+  cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/aiter-wheel-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
+
+  # Named contexts, not registry refs: bake resolves "target:x" by
+  # building x first and feeding its result straight in. That makes
+  # aiter-wheel buildable in the same invocation as its inputs, instead
+  # of requiring them to be pushed in a previous run.
+  contexts = {
+    pytorch-img   = "target:pytorch"
+    triton-wheels = "target:triton-wheel"
+  }
 
   args = {
-    PYTORCH_IMAGE       = "${REGISTRY}/${REGISTRY_NAME}/pytorch:${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}"
-    TRITON_WHEEL_IMAGE  = "${REGISTRY}/${REGISTRY_NAME}/triton-wheel:${ROCM_VERSION}-${ARCH_TAG}"
+    PYTORCH_IMAGE       = "pytorch-img"
+    TRITON_WHEEL_IMAGE  = "triton-wheels"
     AITER_REF           = AITER_REF
     SCCACHE_VERSION     = SCCACHE_VERSION
     PYTORCH_ROCM_ARCH   = PYTORCH_ROCM_ARCH
@@ -351,8 +372,14 @@ target "pytorch-run" {
     PYTHON_VERSION = PYTHON_VERSION
   }
 
+  # "target:pytorch", not a bare registry ref. A context value with no
+  # recognised scheme is treated as a local directory, so this used to
+  # fail with "stat <registry>/rocm-pytorch/pytorch:...: no such file or
+  # directory" — latent until pytorch-run was first built. Referencing
+  # the target also removes the need for pytorch to be pushed first, and
+  # fixes the hardcoded gfx950 that ignored PYTORCH_ROCM_ARCH.
   contexts = {
-    pytorch = "${REGISTRY}/${REGISTRY_NAME}/pytorch:${PYTORCH_VERSION}-${ROCM_VERSION}-gfx950"
+    pytorch = "target:pytorch"
   }
 
   output = ["type=image,compression=zstd"]

@@ -5,9 +5,16 @@
 ARG PYTHON_VERSION=3.14
 ARG ROCM_VERSION=10.1.0-full
 
-FROM rocm/rocm:rocm_ubuntu24.04_${ROCM_VERSION} AS base
+# rocm/rocm:rocm_ubuntu24.04_* does not exist — that reference was
+# speculative and 503s through the mirror. AMD publishes only
+# dev-ubuntu-26.04:10.1.0-full for this ROCm; there is no -runtime or
+# -base variant, so this image is not as small as "minimal runtime"
+# suggests. Trimming it properly means installing just the ROCm runtime
+# packages onto plain ubuntu rather than taking the full SDK.
+ARG RUNTIME_BASE_IMAGE=rocm/dev-ubuntu-26.04:${ROCM_VERSION}
+FROM ${RUNTIME_BASE_IMAGE} AS base
 
-LABEL org.opencontainers.image.source="https://github.com/your-org/rocm-pytorch-build"
+LABEL org.opencontainers.image.source="https://github.com/sbates130272/rocm-pytorch-build"
 LABEL org.opencontainers.image.description="Minimal PyTorch ROCm runtime for gfx950"
 
 # Prevent interactive prompts

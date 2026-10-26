@@ -22,6 +22,16 @@ REPO ?= $(REGISTRY_NAME)/base
 # Aliased so the recipe text does not contain the literal $(MAKE):
 # make executes any line referencing $(MAKE) even under -n, which made
 # `make -n watch` launch a full-screen watch instead of printing it.
+# The tailnet must never go through the corporate proxy. HTTP_PROXY and
+# HTTPS_PROXY are set in this environment but no_proxy is not, so every
+# proxy-aware tool (curl in some modes, python urllib, Go binaries like
+# zli and docker) tries to reach snoc-* through ZScaler and fails. Set
+# it here so make targets are correct regardless of the user's shell;
+# add the same to your profile for interactive use.
+NO_PROXY_LIST := localhost,127.0.0.1,::1,.ts.net,.local,10.0.0.0/8,100.64.0.0/10
+export no_proxy := $(NO_PROXY_LIST)
+export NO_PROXY := $(NO_PROXY_LIST)
+
 MAKE_BIN := $(MAKE)
 
 MEMCACHED_HOST ?= snoc-strix.fold-leaffish.ts.net
@@ -48,13 +58,13 @@ else
 BAKE = ./telemetry/build.sh
 endif
 
-.PHONY: help zot-check zot-catalog zot-tags zot-wheels zot-logs \
+.PHONY: help zot-check zot-catalog zot-tags zot-wheels zot-wheelhouse zot-logs \
         builder-setup builder-snoc-strix builder-snoc-think builder-snoc-gaming \
         builder-snoc-pool builder-status builder-logs builder-restart \
         build-status build-logs build-inspect builder-ensure watch \
-        cold-build build-aiter push-aiter aiter-wheel \
-        build-wheel push-wheel wheel \
-        build-triton push-triton triton-wheel \
+        cold-build push-aiter-wheel fetch-aiter-wheel push-wheels \
+        push-torch-wheel fetch-torch-wheel \
+        push-triton-wheel fetch-triton-wheel \
         cache-stats cache-summary cache-check cache-logs builder-load \
         build-base build-pytorch build-runtime build-all \
         push-base push-pytorch push-runtime push-all \
@@ -69,10 +79,14 @@ help: ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "; cmd = "sort"} \
 		/^##@/ { if (insec) close(cmd); printf "\n\033[1m%s\033[0m\n", substr($$0, 5); insec = 1; next } \
 		/^[a-zA-Z_-]+:.*?## / { \
-			line = sprintf("  \033[36m%-20s\033[0m %s", $$1, $$2); \
+			name = $$1; text = $$2; \
+			if (substr(text, 1, 2) == "* ") { name = name " *"; text = substr(text, 3) } \
+			line = sprintf("  \033[36m%-20s\033[0m %s", name, text); \
 			if (insec) print line | cmd; else print line } \
 		END { if (insec) close(cmd) }' \
 		$(MAKEFILE_LIST)
+	@printf '\n\033[1mKey\033[0m\n'
+	@printf '  *  part of the default bake group: built by build-all and push-all\n'
 	@printf '\nCommon variables: BUILDER (default %s), REGISTRY, PYTORCH_VERSION,\n' "$(BUILDER)"
 	@printf 'ROCM_VERSION, PYTHON_VERSION, TELEMETRY=0 to skip metrics.\n'
 
@@ -102,7 +116,7 @@ zot-tags: ## List tags for a repo (REPO=rocm-pytorch/base)
 
 # Wheel artifacts are plain images whose only payload is /wheels, so
 # they show up in the catalog like anything else — this filters to them.
-WHEEL_REPOS ?= pytorch-wheel triton-wheel aiter
+WHEEL_REPOS ?= pytorch-wheel triton-wheel aiter-wheel
 zot-wheels: ## List wheel artifacts published to Zot
 	@for r in $(WHEEL_REPOS); do \
 		tags=$$(curl -sf "http://$(REGISTRY)/v2/$(REGISTRY_NAME)/$$r/tags/list" 2>/dev/null \
@@ -113,6 +127,13 @@ zot-wheels: ## List wheel artifacts published to Zot
 			printf '  %-16s (not published)\n' "$$r"; \
 		fi; \
 	done
+
+zot-wheelhouse: ## Show published wheel artifacts and their sizes
+	@python3 .builders/wheelhouse.py "$(REGISTRY)" "$(REGISTRY_NAME)" $(WHEEL_REPOS)
+	@if [ -d dist/wheels ]; then \
+		echo "  --- extracted locally (./dist/wheels) ---"; \
+		ls -1sh dist/wheels/ | tail -n +2 | sed 's/^/      /'; \
+	fi
 
 zot-logs: ## Follow Zot registry logs
 	@sudo journalctl -u zot -f
@@ -451,16 +472,16 @@ endef
 
 ##@ Build
 
-build-base: builder-ensure ## Build ROCm base image
+build-base: builder-ensure ## * Build ROCm base image
 	$(call bake,pytorch-base)
 
-build-pytorch: builder-ensure ## Build PyTorch (depends on base)
+build-pytorch: builder-ensure ## * Build PyTorch (depends on base)
 	$(call bake,pytorch)
 
-build-runtime: builder-ensure ## Build runtime image (depends on pytorch)
+build-runtime: builder-ensure ## * Build runtime image (depends on pytorch)
 	$(call bake,pytorch-run)
 
-build-all: builder-ensure ## Build all targets
+build-all: builder-ensure ## Build every * target (images and wheels)
 	$(call bake,)
 
 # A genuinely cold build: no layer cache AND no compiler-cache hits.
@@ -479,41 +500,38 @@ cold-build: builder-ensure ## Fully cold build (no layer or compiler cache). COL
 # rather than building twice.
 ##@ Push
 
-push-base: builder-ensure ## Build and push base image
+push-base: builder-ensure ## * Build and push base image
 	$(call bake,pytorch-base,--push)
 
-push-pytorch: builder-ensure ## Build and push PyTorch
+push-pytorch: builder-ensure ## * Build and push PyTorch
 	$(call bake,pytorch,--push)
 
-push-runtime: builder-ensure ## Build and push runtime image
+push-runtime: builder-ensure ## * Build and push runtime image
 	$(call bake,pytorch-run,--push)
 
-push-all: builder-ensure ## Build and push all targets
+push-all: builder-ensure ## Build and push every * target
 	$(call bake,,--push)
+
+push-wheels: builder-ensure ## Push just the three wheel artifacts
+	$(call bake,wheels,--push)
 
 ##@ Wheels
 
-push-wheel: builder-ensure ## Build and push the torch wheel image to Zot
+push-torch-wheel: builder-ensure ## * Build and push the torch wheel image to Zot
 	$(call bake,pytorch-wheel,--push)
 
-build-wheel: builder-ensure ## Build the torch wheel image locally
-	$(call bake,pytorch-wheel)
-
 # The wheel lives in an image; this pulls it back onto local disk.
-wheel: ## Extract the torch wheel from Zot into ./dist
+fetch-torch-wheel: ## Fetch the torch wheel from Zot into ./dist
 	@mkdir -p dist
 	@printf 'FROM %s/%s/pytorch-wheel:latest\n' "$(REGISTRY)" "$(REGISTRY_NAME)" \
 		| docker buildx build --builder $(BUILDER) \
 			--output type=local,dest=dist -
 	@ls -la dist/wheels/
 
-build-triton: builder-ensure ## Build the Triton wheel for our ROCm
-	$(call bake,triton)
+push-triton-wheel: builder-ensure ## * Build and push the Triton wheel image
+	$(call bake,triton-wheel,--push)
 
-push-triton: builder-ensure ## Build and push the Triton wheel image
-	$(call bake,triton,--push)
-
-triton-wheel: ## Extract the Triton wheel from Zot into ./dist
+fetch-triton-wheel: ## Fetch the Triton wheel from Zot into ./dist
 	@mkdir -p dist
 	@printf 'FROM %s/%s/triton-wheel:latest\n' "$(REGISTRY)" "$(REGISTRY_NAME)" \
 		| docker buildx build --builder $(BUILDER) \
@@ -522,16 +540,13 @@ triton-wheel: ## Extract the Triton wheel from Zot into ./dist
 
 ##@ AITER
 
-build-aiter: builder-ensure ## Build the AITER wheel (needs pytorch pushed first)
-	$(call bake,aiter)
-
-push-aiter: builder-ensure ## Build and push the AITER wheel image
-	$(call bake,aiter,--push)
+push-aiter-wheel: builder-ensure ## * Build and push the AITER wheel image to Zot
+	$(call bake,aiter-wheel,--push)
 
 # The wheel lives in an image; this is how you get it onto local disk.
-aiter-wheel: ## Extract the AITER wheel from the registry into ./dist
+fetch-aiter-wheel: ## Fetch the AITER wheel from Zot into ./dist
 	@mkdir -p dist
-	@printf 'FROM %s/%s/aiter:latest\n' "$(REGISTRY)" "$(REGISTRY_NAME)" \
+	@printf 'FROM %s/%s/aiter-wheel:latest\n' "$(REGISTRY)" "$(REGISTRY_NAME)" \
 		| docker buildx build --builder $(BUILDER) \
 			--output type=local,dest=dist -
 	@ls -la dist/wheels/
