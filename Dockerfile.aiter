@@ -66,6 +66,15 @@ ARG SCCACHE_WEBDAV_KEY_PREFIX=rocm-pytorch
 # finds no device and raises.
 ARG PREBUILD_KERNELS=1
 
+# Empty means derive from the node; set it to pin a job count.
+ARG MAX_JOBS=
+# AITER's kernel compiles are far lighter than cc1plus: measured 4.178GB
+# across 12 jobs on snoc-strix, about 357MB each. The 2GB default used
+# for pytorch and triton would cap this node at 12 of its 32 cores for
+# no reason, and this is the most expensive target in the pipeline. 1GB
+# keeps roughly 3x headroom over what was measured.
+ARG MEM_PER_JOB_GB=1
+
 LABEL org.opencontainers.image.source="https://github.com/ROCm/aiter"
 LABEL org.opencontainers.image.description="AITER wheel for ${PYTORCH_ROCM_ARCH}"
 
@@ -82,6 +91,24 @@ ENV PREBUILD_KERNELS=${PREBUILD_KERNELS} \
     CMAKE_CXX_COMPILER_LAUNCHER=sccache \
     CMAKE_HIP_COMPILER_LAUNCHER=sccache \
     CMAKE_POLICY_VERSION_MINIMUM=3.5
+
+# hipcc's own launcher hook, which is the only way AITER's compiles
+# reach sccache. CMAKE_*_COMPILER_LAUNCHER does nothing here: AITER's
+# JIT builds never invoke CMake. They use a vendored copy of PyTorch's
+# cpp_extension, which writes a ninja file calling the compiler by
+# absolute path:
+#
+#   nvcc = [_join_rocm_home("bin", "hipcc")]
+#
+# so there is no launcher for CMake to insert. Measured consequence:
+# a 2.5-hour AITER build sent zero requests to the cache server.
+#
+# hipcc reads HIP_CLANG_LAUNCHER and prefixes its clang invocation with
+# it. Verified on this image: two identical hipcc compiles give one
+# miss then one hit, classified HIP, with the ROCm install untouched —
+# unlike wrapping hipcc itself, which broke its self-location and
+# produced "HIP version file not found".
+ENV HIP_CLANG_LAUNCHER=/usr/local/bin/sccache
 
 # sccache lives in Dockerfile.pytorch's *builder* stage and never
 # reaches `final`, which is what this image is FROM. Without it the
@@ -132,17 +159,52 @@ RUN ls -la /opt/triton-wheels/
 #
 # flydsl appears in that list, which is also the whole story on "FlyDSL":
 # it is a PyPI build dependency of AITER, not a PyTorch build option.
-RUN pip install --no-cache-dir build && \
-    python -c "import tomllib; print(chr(10).join(tomllib.load(open('pyproject.toml','rb'))['build-system']['requires']))" \
+RUN python -c "import tomllib; print(chr(10).join(tomllib.load(open('pyproject.toml','rb'))['build-system']['requires']))" \
         > /tmp/build-reqs.txt && \
     echo "--- AITER build-system requires ---" && cat /tmp/build-reqs.txt && \
     pip install --no-cache-dir -r /tmp/build-reqs.txt && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir 'setuptools-scm<10'
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN python -m build --wheel --no-isolation \
-    --outdir /wheels \
+# `setup.py bdist_wheel`, not `python -m build`, because that is what
+# AITER's own release CI runs — .github/workflows/aiter-release.yaml:
+#
+#   docker exec -e PREBUILD_KERNELS=1 -e GPU_ARCHS="..." \
+#     bash -c "python3 setup.py bdist_wheel && ls dist/*.whl"
+#
+# The distinction is not cosmetic. PEP 517 calls
+# get_requires_for_build_wheel first, and in that metadata phase
+# setup.py skips the branch that puts aiter/ on sys.path and binds
+# `core`:
+#
+#   if not _is_metadata_only() and not AITER_TRITON_ONLY:
+#       sys.path.insert(0, os.path.join(this_dir, "aiter"))
+#       from jit import core
+#
+# but the PREBUILD_KERNELS block further down is not guarded by the
+# same condition and runs anyway, because torch is installed here. That
+# gave "ModuleNotFoundError: No module named 'jit'", and once PYTHONPATH
+# fixed the import, "NameError: name 'core' is not defined" behind it.
+# setup.py bdist_wheel never enters that phase, so neither happens.
+#
+# Upstream also builds GPU-less when the runner has no /dev/kfd, which
+# is our case: they pass the device flags conditionally and keep
+# PREBUILD_KERNELS=1 either way. GPU_ARCHS is what keeps setup.py from
+# shelling out to rocminfo to detect the target.
+RUN if [ -z "${MAX_JOBS}" ]; then \
+        cores=$(nproc); \
+        jobs=$(awk -v per="${MEM_PER_JOB_GB}" '/^MemAvailable:/ {print int($2/1024/1024/per)}' /proc/meminfo); \
+        [ -n "${jobs}" ] || jobs=${cores}; \
+        [ "${jobs}" -ge 1 ] || jobs=1; \
+        [ "${jobs}" -le "${cores}" ] || jobs=${cores}; \
+        export MAX_JOBS=${jobs}; \
+        echo "MAX_JOBS=${MAX_JOBS} (from ${cores} cores, $(awk '/^MemAvailable:/ {printf "%.0fGB", $2/1048576}' /proc/meminfo) available, ${MEM_PER_JOB_GB}GB/job)"; \
+    else \
+        echo "MAX_JOBS=${MAX_JOBS} (pinned via build arg)"; \
+    fi; \
+    python setup.py bdist_wheel --dist-dir=/wheels \
     2>&1 | tee /wheels-build.log \
     && sccache --show-stats | tee /wheels-sccache-stats.txt
 
@@ -153,7 +215,7 @@ RUN ls -la /wheels/
 # ─── Wheel-only image ────────────────────────────────────────────
 # scratch, not the PyTorch image: this exists to be consumed by
 # `COPY --from=`, so it should carry the wheel and nothing else.
-FROM scratch AS final
+FROM scratch AS wheel
 
 ARG PYTORCH_ROCM_ARCH
 LABEL org.opencontainers.image.source="https://github.com/ROCm/aiter"

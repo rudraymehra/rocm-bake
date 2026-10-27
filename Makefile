@@ -133,6 +133,7 @@ endif
         push-torch-wheel fetch-torch-wheel \
         push-triton-wheel fetch-triton-wheel \
         cache-stats cache-summary cache-check cache-logs builder-load \
+        layer-summary \
         list-vars \
         build-base build-pytorch build-runtime build-all \
         push-base push-pytorch push-runtime push-all \
@@ -189,6 +190,21 @@ zot-logs: ## Follow Zot registry logs
 # WebDAV has no stats verb, so unlike memcached the store cannot report
 # hit rates — only size and object count. Hit rates come from sccache
 # itself, which prints --show-stats at the end of each build.
+# The other cache. sccache stores compiler objects; this is buildkit's
+# layer reuse, and the two move independently — a Dockerfile edit can
+# drop layer reuse to 5% while sccache still serves every compile.
+#
+# Keyed by image, not by node. Which node a target ran on is an
+# artefact of scheduling — the balancer moves targets between nodes run
+# to run — so a per-node view answers "what did this machine last do"
+# when the question is "how much of this image did we rebuild". The
+# node is still shown, because it explains a low number: a target that
+# moved nodes cannot use the previous node's local buildkit cache and
+# must refetch from Zot.
+layer-summary: ## Layer reuse on the most recent build of each image
+	@printf '\033[36m══ layer reuse\033[0m  (shared cache: Zot on %s)\n' "$(WEBDAV_HOST)"
+	@timeout 40 python3 .builders/history.py --by-image $(WATCH_BUILDERS) 2>/dev/null
+
 cache-stats: ## Show the shared compiler-cache (WebDAV) state
 	@curl -sf -o /dev/null -w "  endpoint            HTTP %{http_code}  $(WEBDAV_URL)\n" "$(WEBDAV_URL)/" \
 		|| { echo "  endpoint            UNREACHABLE  $(WEBDAV_URL)"; exit 1; }
@@ -207,19 +223,19 @@ cache-summary: ## One-line cache state plus deltas since the last call
 	@objs=$$(sudo find $(WEBDAV_DIR) -type f 2>/dev/null | wc -l); \
 	size=$$(sudo du -sb $(WEBDAV_DIR) 2>/dev/null | cut -f1); \
 	if [ -z "$$size" ]; then \
-		echo "══ sccache store unreachable at $(WEBDAV_DIR)"; \
+		printf '\033[36m══ sccache store\033[0m unreachable at %s\n' "$(WEBDAV_DIR)"; \
 	else \
 		echo "$$objs $$size" > $(CACHE_STATE).now; \
 		[ -s $(CACHE_STATE) ] || cp $(CACHE_STATE).now $(CACHE_STATE); \
 		paste $(CACHE_STATE).now $(CACHE_STATE) \
 		| awk '{ \
 			o=$$1; b=$$2; po=$$3; pb=$$4; \
-			printf "══ sccache store (WebDAV, durable)\n"; \
-			printf "objects=%d  size=%.2fGB\n", o, b/1073741824; \
+			printf "\033[36m══ sccache store (WebDAV, durable)\033[0m\n"; \
+			printf "  objects=%d  size=%.2fGB\n", o, b/1073741824; \
 			if (o - po <= 0) \
-				printf "interval  idle (no new objects since last refresh)\n"; \
+				printf "  interval  idle (no new objects since last refresh)\n"; \
 			else \
-				printf "interval  +%d objects  +%.0fMB\n", o-po, (b-pb)/1048576; \
+				printf "  interval  +%d objects  +%.0fMB\n", o-po, (b-pb)/1048576; \
 			}'; \
 		mv $(CACHE_STATE).now $(CACHE_STATE); \
 	fi
@@ -375,12 +391,14 @@ watch: ## Live build history across all snoc-* builders (WATCH_BUILDERS=, WATCH_
 		printf "\\033[1mROCm PyTorch Build\\033[0m — watching %s · refresh %ss · %s\\n" \
 			"$(strip $(WATCH_BUILDERS))" "$(WATCH_INTERVAL)" "$$(date +%H:%M:%S)"; \
 		echo; \
+		$(MAKE_BIN) --no-print-directory layer-summary; \
+		echo; \
 		$(MAKE_BIN) --no-print-directory cache-summary; \
 		echo; \
 		for b in $(WATCH_BUILDERS); do \
 			out=$$(python3 .builders/history.py $$b $(WATCH_HISTORY) 2>/dev/null); \
 			[ -n "$$out" ] || continue; \
-			echo "══ $$b"; \
+			printf "\\033[36m══ %s\\033[0m\\n" "$$b"; \
 			echo "$$out"; \
 			run=$$(timeout 8 docker buildx history ls --builder $$b \
 				--filter status=running --format "{{.Ref}}" 2>/dev/null); \
@@ -393,7 +411,7 @@ watch: ## Live build history across all snoc-* builders (WATCH_BUILDERS=, WATCH_
 		for b in $(WATCH_BUILDERS); do \
 			for id in $$(docker buildx history ls --builder $$b \
 					--filter status=running --format "{{.Ref}}" 2>/dev/null); do \
-				echo "──── $$b / $$id ────"; \
+				printf "\\033[36m──── %s / %s ────\\033[0m\\n" "$$b" "$$id"; \
 				timeout 3 docker buildx history logs "$$id" --builder $$b \
 					> $(WATCH_TMP) 2>&1 || true; \
 				grep -v "^$$" $(WATCH_TMP) \
@@ -444,9 +462,10 @@ builder-load: ## Show CPU, cores and load for each node of $(BUILDER)
 			line=$$(printf '   %-14s cpu=%-9s of %s cores   mem=%-22s load=%s' \
 				"$$node" "$$cpu" "$$cores" "$$mem" "$$load"); \
 			if [ -n "$$cpu" ] && [ -n "$$cores" ]; then \
-				echo "$$line" | tee "$(LOAD_CACHE).$$node" ; \
+				echo "$$line" > "$(LOAD_CACHE).$$node"; \
+				printf '\033[32m%s\033[0m\n' "$$line"; \
 			elif [ -s "$(LOAD_CACHE).$$node" ]; then \
-				printf '%s  (stale)\n' "$$(cat $(LOAD_CACHE).$$node)"; \
+				printf '\033[32m%s\033[0m  (stale)\n' "$$(cat $(LOAD_CACHE).$$node)"; \
 			else \
 				printf '   %-14s (load unavailable)\n' "$$node"; \
 			fi; \
@@ -573,7 +592,7 @@ push-base: builder-ensure ## * Build and push base image
 push-pytorch: builder-ensure ## * Build and push PyTorch
 	$(call bake,pytorch,--push)
 
-push-runtime: builder-ensure ## * Build and push runtime image
+push-runtime: builder-ensure ## Build and push runtime image
 	$(call bake,pytorch-run,--push)
 
 BALANCE_STREAM ?= 1
@@ -614,8 +633,6 @@ fetch-triton-wheel: ## Fetch the Triton wheel from Zot into ./dist
 			--output type=local,dest=dist -
 	@ls -la dist/wheels/
 
-##@ AITER
-
 push-aiter-wheel: builder-ensure ## * Build and push the AITER wheel image to Zot
 	$(call bake,aiter-wheel,--push)
 
@@ -627,10 +644,14 @@ fetch-aiter-wheel: ## Fetch the AITER wheel from Zot into ./dist
 			--output type=local,dest=dist -
 	@ls -la dist/wheels/
 
-# ─── Test ─────────────────────────────────────────────────────────
-##@ Test
+# ─── Run ──────────────────────────────────────────────────────────
+# Executing what the Build section produced, as opposed to producing
+# it. These need a node that can actually run the artifact — the test
+# stage asserts against a real device — and no node on the fleet has a
+# usable GPU at present, which is why none of this is in push-all.
+##@ Run
 
-test: builder-ensure ## Run test target
+test: builder-ensure ## Run the test stage against a GPU
 	$(call bake,pytorch-test)
 
 # ─── Utilities ────────────────────────────────────────────────────

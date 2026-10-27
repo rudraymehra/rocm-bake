@@ -43,9 +43,18 @@ MIN_MEM_GB="${MIN_MEM_GB:-8}"
 # Stages run in order; targets within a stage run concurrently on
 # different nodes. The dependencies are real: pytorch needs base, and
 # aiter needs both pytorch and the triton wheels.
+# Order within a stage is priority, not preference: targets are handed
+# to nodes best-first, so the most expensive target must be listed
+# first or it gets whatever is left. That was backwards for stage 3 —
+# aiter-wheel was last, so the 50-minute kernel compile landed on the
+# weakest node at MAX_JOBS=12 while two targets costing 67s and 32s
+# took snoc-think's 32 jobs.
 STAGE_1="pytorch-base"
 STAGE_2="pytorch triton-wheel"
-STAGE_3="pytorch-run pytorch-wheel aiter-wheel"
+# pytorch-run omitted: no node has a working GPU, so the runtime image
+# cannot be exercised and is not worth a slot. Add it back here when
+# one does.
+STAGE_3="aiter-wheel pytorch-wheel"
 
 # ── node capacity ────────────────────────────────────────────────
 # score = free GB of RAM + idle cores. Memory is weighted equally with

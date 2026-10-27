@@ -108,6 +108,9 @@ ARG FORCE_RECACHE=false
 # PyTorch's build uses every core, which OOMs a memory-light node the
 # same way triton did.
 ARG MAX_JOBS=
+# Memory budget per compile job, used to derive MAX_JOBS. 2GB is
+# measured for cc1plus: triton died at 32 jobs on a 30GB node.
+ARG MEM_PER_JOB_GB=2
 ENV SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
     SCCACHE_SERVER_UDS=/tmp/sccache.sock \
     SCCACHE_WEBDAV_KEY_PREFIX=${SCCACHE_WEBDAV_KEY_PREFIX} \
@@ -118,6 +121,11 @@ ENV SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
     CMAKE_C_COMPILER_LAUNCHER=sccache \
     CMAKE_CXX_COMPILER_LAUNCHER=sccache \
     CMAKE_HIP_COMPILER_LAUNCHER=sccache
+
+# hipcc's launcher hook: CMAKE_*_COMPILER_LAUNCHER only covers
+# CMake-driven compiles, and parts of this build call hipcc
+# directly. See Dockerfile.aiter for the full reasoning.
+ENV HIP_CLANG_LAUNCHER=/usr/local/bin/sccache
 
 # Each RUN is a fresh container, so the compile step has to start its
 # own sccache server, and startup probes the remote store. That probe is
@@ -229,7 +237,7 @@ RUN if [ "${FORCE_RECACHE}" = "true" ] || [ "${FORCE_RECACHE}" = "1" ]; then \
     fi; \
     if [ -z "${MAX_JOBS}" ]; then \
         cores=$(nproc); \
-        jobs=$(awk '/^MemAvailable:/ {print int($2/1024/1024/2)}' /proc/meminfo); \
+        jobs=$(awk -v per="${MEM_PER_JOB_GB}" '/^MemAvailable:/ {print int($2/1024/1024/per)}' /proc/meminfo); \
         [ -n "${jobs}" ] || jobs=${cores}; \
         [ "${jobs}" -ge 1 ] || jobs=1; \
         [ "${jobs}" -le "${cores}" ] || jobs=${cores}; \

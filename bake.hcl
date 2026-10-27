@@ -202,9 +202,14 @@ variable "REQUIRE_SCCACHE" {
 # GPU (`make test` on snoc-strix), not something that can run inside the
 # build graph, and including it here made build-all and push-all fail at
 # the last target every time.
+# pytorch-run is deliberately absent. The runtime image is only worth
+# publishing where it can be exercised, and no node currently has a
+# usable GPU; building it every run costs time and a Zot push for an
+# artifact nobody can test. `make push-runtime` still builds it, and it
+# belongs back in this list once a GPU node is available.
 group "default" {
   targets = [
-    "pytorch-base", "pytorch", "pytorch-run",
+    "pytorch-base", "pytorch",
     "pytorch-wheel", "triton-wheel", "aiter-wheel",
   ]
 }
@@ -375,6 +380,10 @@ target "triton-wheel" {
 # on whichever node is free — it is independent of the runtime image.
 target "aiter-wheel" {
   dockerfile = "Dockerfile.aiter"
+  # Pinned, not left to the last stage in the file: appending a stage
+  # to Dockerfile.aiter would otherwise silently repoint this target,
+  # which is what happened to "pytorch" before 680b4cc.
+  target     = "wheel"
   platforms  = ["linux/amd64"]
 
   tags = compact([
