@@ -24,6 +24,10 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# Record this run so `make build-stop` can find it without matching
+# command lines, which is unreliable — see .builders/build-stop.sh.
+echo $$ >> "${BUILD_PIDFILE:-/tmp/.rocm-build.pids}"
+
 DRY_RUN=0
 BEST_ONLY=0
 PUSH=1
@@ -49,12 +53,15 @@ MIN_MEM_GB="${MIN_MEM_GB:-8}"
 # aiter-wheel was last, so the 50-minute kernel compile landed on the
 # weakest node at MAX_JOBS=12 while two targets costing 67s and 32s
 # took snoc-think's 32 jobs.
-STAGE_1="pytorch-base"
-STAGE_2="pytorch triton-wheel"
+# Overridable so a run can skip a target without editing this file —
+# e.g. STAGE_3="pytorch-wheel" to build a new arch without AITER, which
+# costs more than everything else combined.
+STAGE_1="${STAGE_1:-pytorch-base}"
+STAGE_2="${STAGE_2:-pytorch triton-wheel}"
 # pytorch-run omitted: no node has a working GPU, so the runtime image
 # cannot be exercised and is not worth a slot. Add it back here when
 # one does.
-STAGE_3="aiter-wheel pytorch-wheel"
+STAGE_3="${STAGE_3:-aiter-wheel pytorch-wheel}"
 
 # ── node capacity ────────────────────────────────────────────────
 # score = free GB of RAM + idle cores. Memory is weighted equally with

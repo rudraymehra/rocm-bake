@@ -38,6 +38,10 @@ export NO_PROXY := $(NO_PROXY_LIST)
 # Aliased so the recipe text does not contain the literal $(MAKE):
 # make executes any line referencing $(MAKE) even under -n, which made
 # `make -n watch` launch a full-screen watch instead of printing it.
+# Where running builds record themselves, for `make build-stop`.
+BUILD_PIDFILE ?= /tmp/.rocm-build.pids
+export BUILD_PIDFILE
+
 MAKE_BIN := $(MAKE)
 
 # Shared compiler-cache store on Strix: nginx WebDAV over a directory
@@ -127,6 +131,7 @@ endif
         builder-setup builder-snoc-strix builder-snoc-think builder-snoc-gaming \
         builder-snoc-pool builder-status builder-logs builder-restart \
         build-status build-logs build-inspect builder-ensure watch \
+        build-stop gpu-test \
         cold-build push-aiter-wheel fetch-aiter-wheel push-wheels \
         build-torch-wheel build-triton-wheel build-aiter-wheel \
         _build-all _push-all \
@@ -471,6 +476,9 @@ builder-load: ## Show CPU, cores and load for each node of $(BUILDER)
 			fi; \
 		done
 
+build-stop: ## Stop builds started from this repo (balancer, bake clients)
+	@.builders/build-stop.sh
+
 build-status: ## List build records for $(BUILDER), with the node each ran on
 	@python3 .builders/history.py $(BUILDER) $(WATCH_HISTORY)
 
@@ -511,7 +519,8 @@ builder-ensure:
 #   $(1) bake target ("" = the default group)
 #   $(2) extra flags (--push)
 define bake
-@b="$(BUILDER)"; \
+@echo $$$$ >> $(BUILD_PIDFILE); \
+b="$(BUILDER)"; \
 if [ "$$b" = "$(POOL_BUILDER)" ]; then \
 	b=$$(.builders/balance.sh --best); \
 	echo "balance: $(POOL_BUILDER) -> $$b"; \
@@ -653,6 +662,14 @@ fetch-aiter-wheel: ## Fetch the AITER wheel from Zot into ./dist
 
 test: builder-ensure ## Run the test stage against a GPU
 	$(call bake,pytorch-test)
+
+# The node with the GPU is rarely the node driving the build, so this
+# runs over ssh by default. GPU_HOST is the machine with /dev/kfd;
+# PYTORCH_ROCM_ARCH selects which image to test, so the same target
+# covers every architecture we publish.
+GPU_HOST ?= snoc-thinkstation
+gpu-test: ## Run the published image on a real GPU (GPU_HOST=, PYTORCH_ROCM_ARCH=)
+	@.builders/gpu-test.sh --host "$(GPU_HOST)" --arch "$(PYTORCH_ROCM_ARCH)"
 
 # ─── Utilities ────────────────────────────────────────────────────
 ##@ Utilities
