@@ -18,10 +18,8 @@ REPO ?= $(REGISTRY_NAME)/base
 # *containers* lack MagicDNS). Note the builder is named snoc-think but
 # the machine is snoc-thinkstation — there is no snoc-think on the
 # tailnet, so this variable keeps the real hostname.
-# Shared compiler-cache store (memcached + extstore) on Strix.
-# Aliased so the recipe text does not contain the literal $(MAKE):
-# make executes any line referencing $(MAKE) even under -n, which made
-# `make -n watch` launch a full-screen watch instead of printing it.
+# (THINK_HOST and GAMING_HOST are defined below.)
+
 # The tailnet must never go through the corporate proxy. HTTP_PROXY and
 # HTTPS_PROXY are set in this environment but no_proxy is not, so every
 # proxy-aware tool (curl in some modes, python urllib, Go binaries like
@@ -32,10 +30,25 @@ NO_PROXY_LIST := localhost,127.0.0.1,::1,.ts.net,.local,10.0.0.0/8,100.64.0.0/10
 export no_proxy := $(NO_PROXY_LIST)
 export NO_PROXY := $(NO_PROXY_LIST)
 
+# Aliased so the recipe text does not contain the literal $(MAKE):
+# make executes any line referencing $(MAKE) even under -n, which made
+# `make -n watch` launch a full-screen watch instead of printing it.
 MAKE_BIN := $(MAKE)
 
-MEMCACHED_HOST ?= snoc-strix.fold-leaffish.ts.net
-MEMCACHED_PORT ?= 11211
+# Shared compiler-cache store on Strix: nginx WebDAV over a directory
+# tree, so it survives a reboot. Replaced memcached, which did not.
+WEBDAV_HOST ?= snoc-strix.fold-leaffish.ts.net
+WEBDAV_PORT ?= 8081
+WEBDAV_URL  ?= http://$(WEBDAV_HOST):$(WEBDAV_PORT)
+WEBDAV_DIR  ?= /var/cache/sccache-webdav
+
+# A sentinel, not a builder. BUILDER=snoc-pool means "let the balancer
+# choose"; requests for it are routed through .builders/balance.sh,
+# which runs each target against a concrete node. Nothing is ever built
+# against a buildx pool now, so the pool builder need not exist — and if
+# it does, its records never update, which is why watch skips it.
+# Reclaim its containers with: docker buildx rm snoc-pool
+POOL_BUILDER ?= snoc-pool
 
 THINK_HOST ?= snoc-thinkstation
 GAMING_HOST ?= snoc-gaming
@@ -68,6 +81,7 @@ endif
         builder-snoc-pool builder-status builder-logs builder-restart \
         build-status build-logs build-inspect builder-ensure watch \
         cold-build push-aiter-wheel fetch-aiter-wheel push-wheels \
+        _build-all _push-all \
         push-torch-wheel fetch-torch-wheel \
         push-triton-wheel fetch-triton-wheel \
         cache-stats cache-summary cache-check cache-logs builder-load \
@@ -90,8 +104,6 @@ help: ## Show this help
 			if (insec) print line | cmd; else print line } \
 		END { if (insec) close(cmd) }' \
 		$(MAKEFILE_LIST)
-	@printf '\n\033[1mKey\033[0m\n'
-	@printf '  *  part of the default bake group: built by build-all and push-all\n'
 	@printf '\nCommon variables: BUILDER (default %s), REGISTRY, PYTORCH_VERSION,\n' "$(BUILDER)"
 	@printf 'ROCM_VERSION, PYTHON_VERSION, TELEMETRY=0 to skip metrics.\n'
 
@@ -122,16 +134,8 @@ zot-tags: ## List tags for a repo (REPO=rocm-pytorch/base)
 # Wheel artifacts are plain images whose only payload is /wheels, so
 # they show up in the catalog like anything else — this filters to them.
 WHEEL_REPOS ?= pytorch-wheel triton-wheel aiter-wheel
-zot-wheels: ## List wheel artifacts published to Zot
-	@for r in $(WHEEL_REPOS); do \
-		tags=$$(curl -sf "http://$(REGISTRY)/v2/$(REGISTRY_NAME)/$$r/tags/list" 2>/dev/null \
-			| python3 -c "import json,sys; print(' '.join(sorted(json.load(sys.stdin)['tags'])))" 2>/dev/null); \
-		if [ -n "$$tags" ]; then \
-			printf '  %-16s %s\n' "$$r" "$$tags"; \
-		else \
-			printf '  %-16s (not published)\n' "$$r"; \
-		fi; \
-	done
+zot-wheels: ## List wheel artifacts published to Zot, with sizes
+	@python3 .builders/wheelhouse.py --brief "$(REGISTRY)" "$(REGISTRY_NAME)" $(WHEEL_REPOS)
 
 zot-wheelhouse: ## Show published wheel artifacts and their sizes
 	@python3 .builders/wheelhouse.py "$(REGISTRY)" "$(REGISTRY_NAME)" $(WHEEL_REPOS)
@@ -146,63 +150,44 @@ zot-logs: ## Follow Zot registry logs
 # ─── Buildx Builder Setup ────────────────────────────────────────
 ##@ Compiler Cache
 
-# The sccache store every node shares. `stats` is a memcached verb, not
-# something sccache can report: the sccache server lives and dies with
-# the build container, so the store itself is the only durable view.
-cache-stats: ## Show the shared compiler-cache (memcached) state
-	@printf 'stats\r\nquit\r\n' | timeout 5 nc $(MEMCACHED_HOST) $(MEMCACHED_PORT) 2>/dev/null \
-		| grep -E '^STAT (cmd_get|cmd_set|get_hits|get_misses|curr_items|total_items|bytes|limit_maxbytes|evictions|expired_unfetched|extstore_pages_used|extstore_pages_free|extstore_bytes_written|extstore_page_evictions) ' \
-		| tr -d '\r' | sed 's/^STAT /  /' \
-		|| { echo "No memcached at $(MEMCACHED_HOST):$(MEMCACHED_PORT)"; exit 1; }
-	@printf 'stats\r\nquit\r\n' | timeout 5 nc $(MEMCACHED_HOST) $(MEMCACHED_PORT) 2>/dev/null \
-		| awk -F'[ \r]' '/^STAT get_hits/{h=$$3} /^STAT get_misses/{m=$$3} \
-			/^STAT cmd_get/{g=$$3} /^STAT cmd_set/{w=$$3} \
-			/^STAT bytes /{b=$$3} /^STAT limit_maxbytes/{l=$$3} \
-			END { \
-			  if (l > 0) printf "  ram_tier_used       %.1f%% of %.0fGB\n", 100*b/l, l/1073741824; \
-			  if (w > 0 && g < w/10) { \
-			    printf "  reads               %d vs %d writes — WRITE-ONLY\n", g, w; \
-			    printf "  NOTE  sccache is not reading the cache. SCCACHE_RECACHE is\n"; \
-			    printf "        presence-tested, so even =false disables reads.\n"; \
-			  } else if (h+m > 0) { \
-			    printf "  hit_rate            %.1f%% over %d reads\n", 100*h/(h+m), g; \
-			  } }'
+# The sccache store every node shares: nginx WebDAV over a directory
+# tree on Strix. It replaced memcached, which held everything in RAM and
+# lost the fleet's cache on every power cycle.
+#
+# WebDAV has no stats verb, so unlike memcached the store cannot report
+# hit rates — only size and object count. Hit rates come from sccache
+# itself, which prints --show-stats at the end of each build.
+cache-stats: ## Show the shared compiler-cache (WebDAV) state
+	@curl -sf -o /dev/null -w "  endpoint            HTTP %{http_code}  $(WEBDAV_URL)\n" "$(WEBDAV_URL)/" \
+		|| { echo "  endpoint            UNREACHABLE  $(WEBDAV_URL)"; exit 1; }
+	@sudo du -sh $(WEBDAV_DIR) 2>/dev/null | awk '{printf "  size                %s\n", $$1}'
+	@sudo find $(WEBDAV_DIR) -type f 2>/dev/null | wc -l | awk '{printf "  objects             %s\n", $$1}'
+	@df -h $(WEBDAV_DIR) 2>/dev/null | tail -1 \
+		| awk '{printf "  filesystem          %s of %s used, %s free\n", $$3, $$2, $$4}'
+	@echo "  hit_rate            see 'sccache --show-stats' in the build log"
 
 CACHE_STATE := /tmp/.rocm-cache-prev
 
-# Lifetime counters average over every build since memcached started, so
-# they say nothing about the build in front of you. This prints current
-# state plus the delta since the previous call, which is the number that
-# moves while a build runs.
+# Totals alone say nothing about the build in front of you, so this
+# prints current state plus the delta since the previous call — the
+# number that moves while a build runs.
 cache-summary: ## One-line cache state plus deltas since the last call
-	@printf 'stats\r\nquit\r\n' | timeout 2 nc $(MEMCACHED_HOST) $(MEMCACHED_PORT) 2>/dev/null \
-		| awk -F'[ \r]' '/^STAT (cmd_get|cmd_set|get_hits|curr_items|bytes|limit_maxbytes|evictions|extstore_pages_used) /{v[$$2]=$$3} \
-			END { printf "%s %s %s %s %s %s %s %s\n", \
-				v["cmd_get"]+0, v["cmd_set"]+0, v["get_hits"]+0, v["curr_items"]+0, \
-				v["bytes"]+0, v["limit_maxbytes"]+0, v["evictions"]+0, v["extstore_pages_used"]+0 }' \
-		> $(CACHE_STATE).now 2>/dev/null; \
-	if [ ! -s $(CACHE_STATE).now ]; then \
-		echo "══ sccache store unreachable at $(MEMCACHED_HOST):$(MEMCACHED_PORT)"; \
+	@objs=$$(sudo find $(WEBDAV_DIR) -type f 2>/dev/null | wc -l); \
+	size=$$(sudo du -sb $(WEBDAV_DIR) 2>/dev/null | cut -f1); \
+	if [ -z "$$size" ]; then \
+		echo "══ sccache store unreachable at $(WEBDAV_DIR)"; \
 	else \
+		echo "$$objs $$size" > $(CACHE_STATE).now; \
 		[ -s $(CACHE_STATE) ] || cp $(CACHE_STATE).now $(CACHE_STATE); \
 		paste $(CACHE_STATE).now $(CACHE_STATE) \
 		| awk '{ \
-			g=$$1; w=$$2; h=$$3; i=$$4; b=$$5; l=$$6; e=$$7; x=$$8; \
-			pg=$$9; pw=$$10; ph=$$11; \
-			dg=g-pg; dw=w-pw; dh=h-ph; \
-			printf "══ sccache store\n"; \
-			printf "items=%d  ram=%.2f/%.0fGB  disk_pages=%d  evict=%d\n", \
-				i, b/1073741824, l/1073741824, x, e; \
-			if (dg+dw == 0) { \
-				printf "interval  idle (no cache traffic since last refresh)\n"; \
-			} else if (dg < dw/10) { \
-				printf "interval  +%d writes  +%d reads  WRITE-ONLY — sccache is not reading\n", dw, dg; \
-			} else { \
-				printf "interval  +%d writes  +%d reads  hit=%.0f%%\n", \
-					dw, dg, (dg>0 ? 100*dh/dg : 0); \
-			} \
-			if (g > 0) \
-				printf "lifetime  %d writes  %d reads  hit=%.0f%%\n", w, g, 100*h/g; \
+			o=$$1; b=$$2; po=$$3; pb=$$4; \
+			printf "══ sccache store (WebDAV, durable)\n"; \
+			printf "objects=%d  size=%.2fGB\n", o, b/1073741824; \
+			if (o - po <= 0) \
+				printf "interval  idle (no new objects since last refresh)\n"; \
+			else \
+				printf "interval  +%d objects  +%.0fMB\n", o-po, (b-pb)/1048576; \
 			}'; \
 		mv $(CACHE_STATE).now $(CACHE_STATE); \
 	fi
@@ -211,15 +196,16 @@ cache-check: ## Verify every build node can reach the compiler cache
 	@for h in localhost $(THINK_HOST) $(GAMING_HOST); do \
 		printf '  %-20s ' "$$h"; \
 		if [ "$$h" = localhost ]; then \
-			printf 'version\r\nquit\r\n' | timeout 5 nc $(MEMCACHED_HOST) $(MEMCACHED_PORT) 2>/dev/null | head -1 | tr -d '\r'; \
+			curl -sf -o /dev/null -w 'HTTP %{http_code}' "$(WEBDAV_URL)/" || printf UNREACHABLE; \
 		else \
-			ssh -o BatchMode=yes "$$h" "printf 'version\r\nquit\r\n' | timeout 5 nc $(MEMCACHED_HOST) $(MEMCACHED_PORT) 2>/dev/null | head -1" 2>/dev/null | tr -d '\r'; \
+			ssh -n -o BatchMode=yes "$$h" "curl -sf -o /dev/null -w 'HTTP %{http_code}' '$(WEBDAV_URL)/'" 2>/dev/null \
+				|| printf UNREACHABLE; \
 		fi; \
 		echo; \
 	done
 
-cache-logs: ## Follow the memcached service log
-	@sudo journalctl -u memcached -f
+cache-logs: ## Follow the WebDAV store's access log
+	@sudo tail -f /var/log/nginx/access.log
 
 ##@ Builders
 
@@ -324,7 +310,7 @@ builder-logs: ## Tail buildkitd's own log for each node of $(BUILDER)
 		| while read node endpoint; do \
 			echo "══ $$node ($$endpoint)"; \
 			case "$$endpoint" in \
-				ssh://*) ssh "$${endpoint#ssh://}" \
+				ssh://*) ssh -n "$${endpoint#ssh://}" \
 					"docker logs --tail $(WATCH_LINES) buildx_buildkit_$$node 2>&1" ;; \
 				*) docker logs --tail $(WATCH_LINES) "buildx_buildkit_$$node" 2>&1 ;; \
 			esac; \
@@ -349,7 +335,7 @@ WATCH_TMP := /tmp/.rocm-build-watch.log
 # Override to narrow: make watch WATCH_BUILDERS=snoc-think
 # Parse the table, not --format '{{.Name}}': that prints node names too,
 # so the pool's nodes come back as duplicate builder names.
-WATCH_BUILDERS ?= $(shell docker buildx ls 2>/dev/null | awk 'NR>1 && /^[^ ]/ {gsub(/\*$$/,"",$$1); print $$1}' | grep -E '^snoc-' | tr '\n' ' ')
+WATCH_BUILDERS ?= $(shell docker buildx ls 2>/dev/null | awk 'NR>1 && /^[^ ]/ {gsub(/\*$$/,"",$$1); print $$1}' | grep -E '^snoc-' | grep -v '^$(POOL_BUILDER)$$' | tr '\n' ' ')
 
 watch: ## Live build history across all snoc-* builders (WATCH_BUILDERS=, WATCH_LINES=)
 	@command -v watch > /dev/null || { echo "watch(1) not found: apt-get install procps"; exit 1; }
@@ -360,8 +346,7 @@ watch: ## Live build history across all snoc-* builders (WATCH_BUILDERS=, WATCH_
 		$(MAKE_BIN) --no-print-directory cache-summary; \
 		echo; \
 		for b in $(WATCH_BUILDERS); do \
-			out=$$(docker buildx history ls --builder $$b 2>/dev/null \
-				| tail -n +2 | head -$(WATCH_HISTORY)); \
+			out=$$(python3 .builders/history.py $$b $(WATCH_HISTORY) 2>/dev/null); \
 			[ -n "$$out" ] || continue; \
 			echo "══ $$b"; \
 			echo "$$out"; \
@@ -401,7 +386,7 @@ builder-restart: ## Restart buildkitd for $(BUILDER), clearing stuck builds
 		| while read node endpoint; do \
 			echo "restarting buildkitd on $$node ($$endpoint)"; \
 			case "$$endpoint" in \
-				ssh://*) ssh "$${endpoint#ssh://}" \
+				ssh://*) ssh -n "$${endpoint#ssh://}" \
 					"docker restart buildx_buildkit_$$node" > /dev/null ;; \
 				*) docker restart "buildx_buildkit_$$node" > /dev/null ;; \
 			esac; \
@@ -416,7 +401,7 @@ builder-load: ## Show CPU, cores and load for each node of $(BUILDER)
 		| awk '/^Name:[[:space:]]+[^[:space:]]/ {n=$$2} /^Endpoint:/ {print n, $$2}' \
 		| while read node endpoint; do \
 			case "$$endpoint" in \
-				ssh://*) stats=$$(timeout 6 ssh -o BatchMode=yes "$${endpoint#ssh://}" \
+				ssh://*) stats=$$(timeout 6 ssh -n -o BatchMode=yes "$${endpoint#ssh://}" \
 					"docker stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}' buildx_buildkit_$$node 2>/dev/null; nproc; uptime" 2>/dev/null) ;; \
 				*) stats=$$(docker stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}' "buildx_buildkit_$$node" 2>/dev/null; nproc; uptime) ;; \
 			esac; \
@@ -435,8 +420,8 @@ builder-load: ## Show CPU, cores and load for each node of $(BUILDER)
 			fi; \
 		done
 
-build-status: ## List build records for $(BUILDER)
-	@docker buildx history ls --builder $(BUILDER)
+build-status: ## List build records for $(BUILDER), with the node each ran on
+	@python3 .builders/history.py $(BUILDER) $(WATCH_HISTORY)
 
 # The steps of a build, as opposed to builder-logs which is the daemon.
 # Defaults to the most recent record; pass BUILD=<id> for a specific one.
@@ -458,7 +443,8 @@ build-inspect: ## Duration, steps and cache stats (BUILD=<id>, default: most rec
 	docker buildx history inspect "$$id" --builder $(BUILDER)
 
 builder-ensure:
-	@docker buildx inspect $(BUILDER) > /dev/null 2>&1 || { \
+	@[ "$(BUILDER)" = "$(POOL_BUILDER)" ] && exit 0; \
+	docker buildx inspect $(BUILDER) > /dev/null 2>&1 || { \
 		echo "Builder '$(BUILDER)' does not exist. Create it with:"; \
 		echo "  make builder-$(BUILDER)"; \
 		exit 1; \
@@ -474,8 +460,13 @@ builder-ensure:
 #   $(1) bake target ("" = the default group)
 #   $(2) extra flags (--push)
 define bake
-@$(BAKE) \
-	--builder $(BUILDER) \
+@b="$(BUILDER)"; \
+if [ "$$b" = "$(POOL_BUILDER)" ]; then \
+	b=$$(.builders/balance.sh --best); \
+	echo "balance: $(POOL_BUILDER) -> $$b"; \
+fi; \
+$(BAKE) \
+	--builder "$$b" \
 	--set "*.args.REGISTRY=$(REGISTRY)" \
 	--set "*.args.REGISTRY_NAME=$(REGISTRY_NAME)" \
 	--set "*.args.PYTORCH_VERSION=$(PYTORCH_VERSION)" \
@@ -487,16 +478,32 @@ endef
 
 ##@ Build
 
-build-base: builder-ensure ## * Build ROCm base image
+build-base: builder-ensure ## Build ROCm base image
 	$(call bake,pytorch-base)
 
-build-pytorch: builder-ensure ## * Build PyTorch (depends on base)
+build-pytorch: builder-ensure ## Build PyTorch (depends on base)
 	$(call bake,pytorch)
 
-build-runtime: builder-ensure ## * Build runtime image (depends on pytorch)
+build-runtime: builder-ensure ## Build runtime image (depends on pytorch)
 	$(call bake,pytorch-run)
 
-build-all: builder-ensure ## Build every * target (images and wheels)
+# Not offered for the pool. Scheduling across nodes makes every target
+# its own bake invocation, so they cannot hand results to each other
+# through `target:` contexts — stage 2 would build against whatever is
+# already in Zot rather than what stage 1 just produced, silently. On a
+# single builder the contexts resolve in-process and this is fine.
+build-all: ## Build every * target (images and wheels) — single builder only
+	@if [ "$(BUILDER)" = "$(POOL_BUILDER)" ]; then \
+		echo "build-all cannot use $(POOL_BUILDER): targets are scheduled across"; \
+		echo "nodes as separate builds, so they can only exchange results"; \
+		echo "through the registry. Use one of:"; \
+		echo "  make push-all  BUILDER=$(POOL_BUILDER)   # scheduled, publishes"; \
+		echo "  make build-all BUILDER=snoc-think        # single builder, no push"; \
+		exit 1; \
+	fi
+	@$(MAKE_BIN) --no-print-directory _build-all BUILDER=$(BUILDER)
+
+_build-all: builder-ensure
 	$(call bake,)
 
 # A genuinely cold build: no layer cache AND no compiler-cache hits.
@@ -524,7 +531,16 @@ push-pytorch: builder-ensure ## * Build and push PyTorch
 push-runtime: builder-ensure ## * Build and push runtime image
 	$(call bake,pytorch-run,--push)
 
-push-all: builder-ensure ## Build and push every * target
+BALANCE_STREAM ?= 1
+
+push-all: ## Build and push everything (* targets) — the usual way to build
+	@if [ "$(BUILDER)" = "$(POOL_BUILDER)" ]; then \
+		BALANCE_STREAM=$(BALANCE_STREAM) .builders/balance.sh; \
+	else \
+		$(MAKE_BIN) --no-print-directory _push-all BUILDER=$(BUILDER); \
+	fi
+
+_push-all: builder-ensure
 	$(call bake,,--push)
 
 push-wheels: builder-ensure ## Push just the three wheel artifacts

@@ -78,6 +78,12 @@ variable "TRITON_REF" {
   default = "675c59878aa2280b31f722aaf42b825fcee21de8"
 }
 
+# Compile AITER's kernel modules at build time rather than leaving them
+# to JIT on first use. See Dockerfile.aiter for what each level excludes.
+variable "PREBUILD_KERNELS" {
+  default = "1"
+}
+
 variable "AITER_REF" {
   default = "v0.1.27"
 }
@@ -120,11 +126,11 @@ BASE_LABELS = {
   "org.opencontainers.image.source" = SOURCE_URL
 }
 
-# Shared compiler cache on Strix, reachable from every build node. The
+# Shared compiler cache on Strix (nginx WebDAV, durable on disk). The
 # name resolves inside a build only because the buildkitd config sets
 # [dns] for the build sandbox; see .builders/buildkitd-strix.toml.
-variable "SCCACHE_MEMCACHED" {
-  default = "tcp://snoc-strix.fold-leaffish.ts.net:11211"
+variable "SCCACHE_WEBDAV_ENDPOINT" {
+  default = "http://snoc-strix.fold-leaffish.ts.net:8081"
 }
 
 # Port for the sccache server started inside the build container. Must
@@ -245,7 +251,7 @@ target "pytorch" {
     # as nothing, which is why no build was ever compiler-cached. The
     # CMAKE_*_COMPILER_LAUNCHER values live in Dockerfile.pytorch; only
     # the port and the strictness toggle are worth overriding here.
-    SCCACHE_MEMCACHED    = SCCACHE_MEMCACHED
+    SCCACHE_WEBDAV_ENDPOINT = SCCACHE_WEBDAV_ENDPOINT
     SCCACHE_SERVER_PORT  = SCCACHE_SERVER_PORT
     SCCACHE_VERSION      = SCCACHE_VERSION
     FORCE_RECACHE        = FORCE_RECACHE
@@ -306,7 +312,7 @@ target "triton-wheel" {
     PYTORCH_ROCM_ARCH   = PYTORCH_ROCM_ARCH
     ROCM_VERSION        = ROCM_VERSION
     SCCACHE_VERSION     = SCCACHE_VERSION
-    SCCACHE_MEMCACHED   = SCCACHE_MEMCACHED
+    SCCACHE_WEBDAV_ENDPOINT = SCCACHE_WEBDAV_ENDPOINT
     SCCACHE_SERVER_PORT = SCCACHE_SERVER_PORT
   }
 
@@ -349,9 +355,10 @@ target "aiter-wheel" {
     PYTORCH_IMAGE       = "pytorch-img"
     TRITON_WHEEL_IMAGE  = "triton-wheels"
     AITER_REF           = AITER_REF
+    PREBUILD_KERNELS    = PREBUILD_KERNELS
     SCCACHE_VERSION     = SCCACHE_VERSION
     PYTORCH_ROCM_ARCH   = PYTORCH_ROCM_ARCH
-    SCCACHE_MEMCACHED   = SCCACHE_MEMCACHED
+    SCCACHE_WEBDAV_ENDPOINT = SCCACHE_WEBDAV_ENDPOINT
     SCCACHE_SERVER_PORT = SCCACHE_SERVER_PORT
   }
 

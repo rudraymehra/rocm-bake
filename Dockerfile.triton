@@ -23,7 +23,7 @@ FROM ${BASE_IMAGE} AS builder
 ARG TRITON_REF=675c59878aa2280b31f722aaf42b825fcee21de8
 ARG PYTORCH_ROCM_ARCH=gfx950
 ARG ROCM_VERSION=10.1.0-full
-ARG SCCACHE_MEMCACHED=tcp://snoc-strix.fold-leaffish.ts.net:11211
+ARG SCCACHE_WEBDAV_ENDPOINT=http://snoc-strix.fold-leaffish.ts.net:8081
 ARG SCCACHE_SERVER_PORT=4250
 
 LABEL org.opencontainers.image.source="https://github.com/triton-lang/triton"
@@ -34,7 +34,7 @@ LABEL org.opencontainers.image.description="Triton built for ROCm ${ROCM_VERSION
 ENV MAX_JOBS=32 \
     ROCM_PATH=/opt/rocm \
     PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
-    SCCACHE_MEMCACHED=${SCCACHE_MEMCACHED} \
+    SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
     SCCACHE_SERVER_PORT=${SCCACHE_SERVER_PORT} \
     SCCACHE_IGNORE_CLIENT_VERSION=1 \
     CMAKE_C_COMPILER_LAUNCHER=sccache \

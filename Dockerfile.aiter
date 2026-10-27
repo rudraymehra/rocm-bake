@@ -28,16 +28,27 @@ FROM ${PYTORCH_IMAGE} AS builder
 
 ARG AITER_REF=main
 ARG PYTORCH_ROCM_ARCH=gfx950
-ARG SCCACHE_MEMCACHED=tcp://snoc-strix.fold-leaffish.ts.net:11211
+ARG SCCACHE_WEBDAV_ENDPOINT=http://snoc-strix.fold-leaffish.ts.net:8081
 ARG SCCACHE_SERVER_PORT=4250
+# 0 (upstream default) compiles nothing at package time — kernels are
+# JIT-built on first use, which is why this target finished in 49s and
+# barely touched sccache. 1 compiles the kernel modules for GPU_ARCHS at
+# build time, excluding the _tune modules and limiting MHA to the
+# fmha_v3 forward variants.
+#
+# GPU_ARCHS below is what makes this safe in a build container: without
+# it AITER falls back to "native" and shells out to rocminfo, which
+# finds no device and raises.
+ARG PREBUILD_KERNELS=1
 
 LABEL org.opencontainers.image.source="https://github.com/ROCm/aiter"
 LABEL org.opencontainers.image.description="AITER wheel for ${PYTORCH_ROCM_ARCH}"
 
-ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+ENV PREBUILD_KERNELS=${PREBUILD_KERNELS} \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
     GPU_ARCHS=${PYTORCH_ROCM_ARCH} \
     ROCM_PATH=/opt/rocm \
-    SCCACHE_MEMCACHED=${SCCACHE_MEMCACHED} \
+    SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
     SCCACHE_SERVER_PORT=${SCCACHE_SERVER_PORT} \
     SCCACHE_IGNORE_CLIENT_VERSION=1 \
     CMAKE_C_COMPILER_LAUNCHER=sccache \

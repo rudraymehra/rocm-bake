@@ -18,15 +18,15 @@ set -euo pipefail
 
 MACHINE="${1:-strix}"
 VERSION="${2:-0.19.0}"
-CACHE_SIZE="${3:-200G}"   # retained for the usage string; unused with memcached
-SCCACHE_MEMCACHED="${SCCACHE_MEMCACHED:-tcp://snoc-strix.fold-leaffish.ts.net:11211}"
+CACHE_SIZE="${3:-200G}"   # retained for the usage string; unused with WebDAV
+SCCACHE_WEBDAV_ENDPOINT="${SCCACHE_WEBDAV_ENDPOINT:-http://snoc-strix.fold-leaffish.ts.net:8081}"
 # sccache's own default. Port 9000 is taken by lemond/tailscaled on Strix.
 SERVER_PORT="${4:-4226}"
 TARGET_DIR="/usr/local/bin"
 
 echo "=== sccache Deployer for ${MACHINE^^} ==="
 echo "Version: ${VERSION}"
-echo "Backend:    ${SCCACHE_MEMCACHED}"
+echo "Backend:    ${SCCACHE_WEBDAV_ENDPOINT}"
 echo "Port: ${SERVER_PORT}"
 echo "Machine: ${MACHINE}"
 
@@ -77,12 +77,12 @@ Group=root
 # sccache has no CLI flags for the backend or logging — all
 # configuration is via the environment.
 #
-# memcached, not SCCACHE_DIR. A local disk cache here would be a second,
-# disconnected store: anything compiled on this host would miss
-# everything the build containers have produced, and vice versa. Pointing
-# at the same memcached the containers use makes host-side compiles share
-# one cache with the whole fleet.
-Environment=SCCACHE_MEMCACHED=${SCCACHE_MEMCACHED}
+# The shared WebDAV store, not SCCACHE_DIR. A local disk cache here
+# would be a second, disconnected store: anything compiled on this host
+# would miss everything the build containers have produced, and vice
+# versa. Pointing at the same endpoint the containers use makes
+# host-side compiles share one cache with the whole fleet.
+Environment=SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT}
 Environment=SCCACHE_SERVER_PORT=${SERVER_PORT}
 Environment=SCCACHE_ERROR_LOG=/var/log/sccache/sccache.log
 Environment=SCCACHE_LOG=info
@@ -139,7 +139,7 @@ fi
 echo ""
 echo "=== Deployment Complete ==="
 echo "Server is running on port ${SERVER_PORT}"
-echo "Backend:   ${SCCACHE_MEMCACHED} (shared with every build container)"
+echo "Backend:   ${SCCACHE_WEBDAV_ENDPOINT} (shared with every build container)"
 echo "Logs: /var/log/sccache/sccache.log"
 echo ""
 echo "To verify from a build machine:"

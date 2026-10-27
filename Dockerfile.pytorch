@@ -57,12 +57,12 @@ RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_
     sccache --version
 
 # sccache runs its own server inside this container, backed by the shared
-# memcached on Strix. Three things here are load-bearing:
+# WebDAV store on Strix. Three things here are load-bearing:
 #
-#  - memcached, not SCCACHE_DIR. A local directory is discarded with the
+#  - WebDAV, not SCCACHE_DIR. A local directory is discarded with the
 #    layer, which is how this silently cached nothing before. The store
 #    is shared, so an object compiled on one node is a hit on the others,
-#    and extstore spills past its RAM ceiling onto Strix's disk.
+#    and it is a directory tree on disk, so it survives a reboot.
 #  - A port no host process uses. The builder runs with network=host, so
 #    a client on 4226 would attach to the node's own sccache.service —
 #    and that server executes compiles in the *host* filesystem, where
@@ -72,14 +72,14 @@ RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_
 #    builder's resolver, so without that block this fails with "cache
 #    storage failed to read ... I/O error" and the build silently falls
 #    back to no caching at all.
-ARG SCCACHE_MEMCACHED=tcp://snoc-strix.fold-leaffish.ts.net:11211
+ARG SCCACHE_WEBDAV_ENDPOINT=http://snoc-strix.fold-leaffish.ts.net:8081
 ARG SCCACHE_SERVER_PORT=4250
 # true forces every compile to run and repopulate: a genuinely cold build.
 # Deliberately NOT named SCCACHE_RECACHE. A build ARG is injected into
 # every RUN step's environment, and sccache presence-tests that name, so
 # merely declaring the ARG forces recache mode regardless of its value.
 ARG FORCE_RECACHE=false
-ENV SCCACHE_MEMCACHED=${SCCACHE_MEMCACHED} \
+ENV SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
     SCCACHE_SERVER_PORT=${SCCACHE_SERVER_PORT} \
     SCCACHE_IGNORE_CLIENT_VERSION=1 \
     CMAKE_C_COMPILER_LAUNCHER=sccache \
@@ -90,10 +90,10 @@ ENV SCCACHE_MEMCACHED=${SCCACHE_MEMCACHED} \
 # against a cache that silently is not there.
 ARG REQUIRE_SCCACHE=1
 RUN if sccache --show-stats > /dev/null 2>&1; then \
-        echo "sccache: server up, cache = ${SCCACHE_MEMCACHED}"; \
+        echo "sccache: server up, cache = ${SCCACHE_WEBDAV_ENDPOINT}"; \
     elif [ "${REQUIRE_SCCACHE}" = "1" ]; then \
-        echo "ERROR: sccache could not reach ${SCCACHE_MEMCACHED}." >&2; \
-        echo "  Check memcached.service on Strix, and that this" >&2; \
+        echo "ERROR: sccache could not reach ${SCCACHE_WEBDAV_ENDPOINT}." >&2; \
+        echo "  Check nginx on Strix (sccache-webdav site), and that this" >&2; \
         echo "  builder was created with --driver-opt network=host." >&2; \
         echo "  Build anyway with --set '*.args.REQUIRE_SCCACHE=0'." >&2; \
         exit 1; \
@@ -224,20 +224,21 @@ LABEL org.opencontainers.image.description="PyTorch ${PYTORCH_VERSION} for ${PYT
 # stage being discarded. `make build-report` reads sccache-stats.txt.
 COPY --from=builder /opt/pytorch/build.log /opt/pytorch/sccache-stats.txt /var/log/pytorch-build/
 
-# Install the built wheel
-COPY --from=builder /opt/pytorch/dist/*.whl /opt/pytorch/dist/*.whl
+# Destination is a directory, not a glob. `COPY src/*.whl dest/*.whl`
+# treats the destination literally, so the wheel did not land where the
+# install step looked for it.
+COPY --from=builder /opt/pytorch/dist/ /opt/pytorch/dist/
 
-# Carry the build log and the compiler-cache stats into the shipped
-# image; in the builder stage they are unreachable once the build ends.
-COPY --from=builder /opt/pytorch/build.log /opt/pytorch/sccache-stats.txt /var/log/pytorch-build/
-
+# The torch install must be able to fail the build. Previously the
+# trailing `|| true` covered this whole chain, so when the glob did not
+# expand and pip errored with "Invalid wheel filename ... '*'", the
+# image was published without PyTorch in it.
 RUN pip install --no-cache-dir /opt/pytorch/dist/*.whl \
-    && rm -rf /opt/pytorch/dist/*.whl \
-    && pip install --no-cache-dir \
-        torchaudio \
-        torchdata \
-        torchvision \
-        2>&1 | tee /opt/pytorch/install.log || true
+    && python -c "import torch; print('installed torch', torch.__version__)"
+
+# The extras are genuinely optional, so they alone get the tolerance.
+RUN pip install --no-cache-dir torchaudio torchdata torchvision \
+    2>&1 | tee /var/log/pytorch-build/install.log || true
 
 # Clean build artifacts
 RUN rm -rf /opt/pytorch

@@ -58,7 +58,9 @@ ENV PATH=${ROCM_PATH}/bin:${ROCM_PATH}/hip/bin:${PATH}
 ENV LD_LIBRARY_PATH=${ROCM_PATH}/lib:/opt/rocm/lib
 ENV HSA_OVERRIDE_GFX_VERSION=11.0.2
 
-# Verify installation
-RUN python -c "import torch; print(f'PyTorch {torch.__version__} on {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"no GPU\"}'); exit(0 if torch.cuda.is_available() else 1)"
+# Verify the import only. torch.cuda.is_available() is false inside a
+# buildkit RUN — there is no /dev/kfd — so asserting on it here could
+# never pass; that check belongs in `make test` against a real GPU.
+RUN python -c "import torch; print(f'PyTorch {torch.__version__} (HIP {torch.version.hip})')"
 
 CMD ["-c", "import torch; print(f'PyTorch {torch.__version__} on {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"no GPU\"}'); exit(0 if torch.cuda.is_available() else 1)"]
