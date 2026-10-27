@@ -78,6 +78,16 @@ variable "TRITON_REF" {
   default = "675c59878aa2280b31f722aaf42b825fcee21de8"
 }
 
+# Per-image build timestamps, supplied by the Makefile from the last
+# commit that touched each Dockerfile. Empty when bake is driven
+# directly; the arg is then omitted and BuildKit falls back to the
+# environment, or to wall-clock if that is unset too.
+variable "SDE_BASE"    { default = "" }
+variable "SDE_PYTORCH" { default = "" }
+variable "SDE_TRITON"  { default = "" }
+variable "SDE_AITER"   { default = "" }
+variable "SDE_RUNTIME" { default = "" }
+
 # Empty means each build derives its own job count from the node it
 # lands on, sized by memory rather than cores. Set it to pin one.
 variable "MAX_JOBS" {
@@ -148,24 +158,31 @@ BASE_LABELS = {
 # FROM them, so their digests may churn freely.
 NO_PROVENANCE = ["type=provenance,disabled=true"]
 
-# Shared compiler cache on Strix (nginx WebDAV, durable on disk). The
-# name resolves inside a build only because the buildkitd config sets
-# [dns] for the build sandbox; see .builders/buildkitd-strix.toml.
+# Shared compiler cache on Strix (nginx WebDAV, durable on disk).
+# The Makefile overrides this with the resolved address: in-container
+# DNS for tailnet names proved unreliable under load and silently cost
+# most of the cache. See the WEBDAV_IP comment in the Makefile.
 variable "SCCACHE_WEBDAV_ENDPOINT" {
   default = "http://snoc-strix.fold-leaffish.ts.net:8081"
 }
 
-# Port for the sccache server started inside the build container. Must
-# not collide with the node's own sccache.service (4226), because
-# builders run with --driver-opt network=host.
+# Key namespace within that store. Overridable so a benchmark can run
+# against an isolated prefix and delete it afterwards without touching
+# the fleet's objects.
+variable "SCCACHE_WEBDAV_KEY_PREFIX" {
+  default = "rocm-pytorch"
+}
+
 # 0.8.0 is the floor for caching hipcc -x hip; see Dockerfile.pytorch.
 variable "SCCACHE_VERSION" {
   default = "0.19.0"
 }
 
-variable "SCCACHE_SERVER_PORT" {
-  default = "4250"
-}
+# There is deliberately no SCCACHE_SERVER_PORT here. The build
+# containers address their sccache server over a unix socket instead,
+# because network=host made one fixed port shared fleet-wide; see
+# Dockerfile.pytorch. The host-level daemon in deploy-sccache.sh still
+# uses a port, which is fine: it is not in a container.
 
 # 1 = refuse to start a PyTorch compile with no sccache server, rather
 # than spending an hour rebuilding everything uncached.
@@ -224,6 +241,7 @@ target "pytorch-base" {
   cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/base-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
 
   args = {
+    SOURCE_DATE_EPOCH   = SDE_BASE != "" ? SDE_BASE : null
     ROCM_VERSION   = ROCM_VERSION
     PYTHON_VERSION = PYTHON_VERSION
   }
@@ -261,6 +279,7 @@ target "pytorch" {
   cache-to = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/pytorch-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
 
   args = {
+    SOURCE_DATE_EPOCH   = SDE_PYTORCH != "" ? SDE_PYTORCH : null
     ROCM_VERSION         = ROCM_VERSION
     PYTORCH_VERSION      = PYTORCH_VERSION
     PYTHON_VERSION       = PYTHON_VERSION
@@ -276,7 +295,7 @@ target "pytorch" {
     # CMAKE_*_COMPILER_LAUNCHER values live in Dockerfile.pytorch; only
     # the port and the strictness toggle are worth overriding here.
     SCCACHE_WEBDAV_ENDPOINT = SCCACHE_WEBDAV_ENDPOINT
-    SCCACHE_SERVER_PORT  = SCCACHE_SERVER_PORT
+    SCCACHE_WEBDAV_KEY_PREFIX = SCCACHE_WEBDAV_KEY_PREFIX
     MAX_JOBS            = MAX_JOBS
     SCCACHE_VERSION      = SCCACHE_VERSION
     FORCE_RECACHE        = FORCE_RECACHE
@@ -334,13 +353,14 @@ target "triton-wheel" {
   cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/triton-wheel-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
 
   args = {
+    SOURCE_DATE_EPOCH   = SDE_TRITON != "" ? SDE_TRITON : null
     BASE_IMAGE          = "${REGISTRY}/${REGISTRY_NAME}/base:${ROCM_VERSION}-${PYTHON_VERSION}"
     TRITON_REF          = TRITON_REF
     PYTORCH_ROCM_ARCH   = PYTORCH_ROCM_ARCH
     ROCM_VERSION        = ROCM_VERSION
     SCCACHE_VERSION     = SCCACHE_VERSION
     SCCACHE_WEBDAV_ENDPOINT = SCCACHE_WEBDAV_ENDPOINT
-    SCCACHE_SERVER_PORT = SCCACHE_SERVER_PORT
+    SCCACHE_WEBDAV_KEY_PREFIX = SCCACHE_WEBDAV_KEY_PREFIX
     MAX_JOBS            = MAX_JOBS
   }
 
@@ -382,6 +402,7 @@ target "aiter-wheel" {
   }
 
   args = {
+    SOURCE_DATE_EPOCH   = SDE_AITER != "" ? SDE_AITER : null
     PYTORCH_IMAGE       = "pytorch-img"
     TRITON_WHEEL_IMAGE  = "triton-wheels"
     AITER_REF           = AITER_REF
@@ -389,7 +410,7 @@ target "aiter-wheel" {
     SCCACHE_VERSION     = SCCACHE_VERSION
     PYTORCH_ROCM_ARCH   = PYTORCH_ROCM_ARCH
     SCCACHE_WEBDAV_ENDPOINT = SCCACHE_WEBDAV_ENDPOINT
-    SCCACHE_SERVER_PORT = SCCACHE_SERVER_PORT
+    SCCACHE_WEBDAV_KEY_PREFIX = SCCACHE_WEBDAV_KEY_PREFIX
   }
 
   output = ["type=image,compression=zstd"]
@@ -418,6 +439,7 @@ target "pytorch-run" {
   cache-to = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/runtime-cache:latest,mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true"]
 
   args = {
+    SOURCE_DATE_EPOCH   = SDE_RUNTIME != "" ? SDE_RUNTIME : null
     PYTHON_VERSION = PYTHON_VERSION
   }
 

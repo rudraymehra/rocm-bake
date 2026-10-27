@@ -73,7 +73,32 @@ RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_
 #    storage failed to read ... I/O error" and the build silently falls
 #    back to no caching at all.
 ARG SCCACHE_WEBDAV_ENDPOINT=http://snoc-strix.fold-leaffish.ts.net:8081
-ARG SCCACHE_SERVER_PORT=4250
+# Namespace this project's objects. The store is shared with other
+# projects on the same fleet, and while sccache's keys are content
+# hashes (so sharing is normally safe and desirable), entries written
+# while two containers' sccache servers were crossed over a host port
+# were wrong — a triton build hit them and died with "stdlib.h: No such
+# file or directory" on a system that compiles that header fine. Proven
+# by rebuilding under an isolated prefix: zero such errors.
+#
+# The crossing itself is fixed by SCCACHE_SERVER_UDS above, so this
+# prefix is about abandoning the already-poisoned entries without
+# deleting a store other projects are still using, and about bounding
+# the blast radius if it ever recurs.
+ARG SCCACHE_WEBDAV_KEY_PREFIX=rocm-pytorch
+# A unix socket, not a TCP port. The builders run with
+# --driver-opt network=host, so SCCACHE_SERVER_PORT is shared by every
+# container on the node. A concurrent vLLM build on snoc-strix held
+# 4250, our triton client connected to *its* sccache server, and that
+# server could not see /opt/triton in its own mount namespace:
+#
+#   sccache: error: failed to spawn Command { cd "/opt/triton/build/..."
+#   sccache: caused by: No such file or directory (os error 2)
+#
+# Same root cause as the long-settled "one shared sccache server is
+# impossible" finding: the server compiles from its own filesystem. A
+# socket inside the container cannot be reached by another container,
+# so each build necessarily gets its own server.
 # true forces every compile to run and repopulate: a genuinely cold build.
 # Deliberately NOT named SCCACHE_RECACHE. A build ARG is injected into
 # every RUN step's environment, and sccache presence-tests that name, so
@@ -84,9 +109,12 @@ ARG FORCE_RECACHE=false
 # same way triton did.
 ARG MAX_JOBS=
 ENV SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
-    SCCACHE_SERVER_PORT=${SCCACHE_SERVER_PORT} \
+    SCCACHE_SERVER_UDS=/tmp/sccache.sock \
+    SCCACHE_WEBDAV_KEY_PREFIX=${SCCACHE_WEBDAV_KEY_PREFIX} \
     SCCACHE_IGNORE_CLIENT_VERSION=1 \
     SCCACHE_CONF=/etc/sccache.toml \
+    SCCACHE_ERROR_LOG=/tmp/sccache-err.log \
+    SCCACHE_LOG=warn \
     CMAKE_C_COMPILER_LAUNCHER=sccache \
     CMAKE_CXX_COMPILER_LAUNCHER=sccache \
     CMAKE_HIP_COMPILER_LAUNCHER=sccache
@@ -213,7 +241,7 @@ RUN if [ "${FORCE_RECACHE}" = "true" ] || [ "${FORCE_RECACHE}" = "1" ]; then \
     python -m build --wheel --no-isolation \
     --outdir /opt/pytorch/dist \
     2>&1 | tee /opt/pytorch/build.log \
-    && sccache --show-stats | tee /opt/pytorch/sccache-stats.txt
+    && sccache --show-stats | tee /opt/pytorch/sccache-stats.txt; rc=$?; echo "--- sccache error log: $(wc -c < /tmp/sccache-err.log 2>/dev/null || echo absent) bytes ---"; grep -iE 'error|warn|write' /tmp/sccache-err.log 2>/dev/null | grep -v 'read failed NotFound' | head -40; exit $rc
 
 SHELL ["/bin/sh", "-c"]
 

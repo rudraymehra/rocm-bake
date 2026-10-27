@@ -40,6 +40,22 @@ MAKE_BIN := $(MAKE)
 WEBDAV_HOST ?= snoc-strix.fold-leaffish.ts.net
 WEBDAV_PORT ?= 8081
 WEBDAV_URL  ?= http://$(WEBDAV_HOST):$(WEBDAV_PORT)
+
+# Build containers address the store by IP, resolved here once, not by
+# name. buildkitd is configured with MagicDNS plus two public
+# resolvers; when MagicDNS is slow under load a tailnet lookup falls
+# through to a public resolver, which answers NXDOMAIN, after which the
+# search domain is appended and the query becomes nonsense:
+#
+#   DNS error: no records found for Query { name:
+#     Name("snoc-strix.fold-leaffish.ts.net.fold-leaffish.ts.net.") }
+#
+# That hit both reads and writes — 79 of 361 compiles in one triton
+# build — so objects were recompiled and then thrown away. The name
+# stays the configuration surface; only the containers see an address.
+WEBDAV_IP   ?= $(shell getent hosts $(WEBDAV_HOST) 2>/dev/null | awk '{print $$1; exit}')
+SCCACHE_WEBDAV_ENDPOINT ?= http://$(or $(WEBDAV_IP),$(WEBDAV_HOST)):$(WEBDAV_PORT)
+export SCCACHE_WEBDAV_ENDPOINT
 WEBDAV_DIR  ?= /var/cache/sccache-webdav
 
 # A sentinel, not a builder. BUILDER=snoc-pool means "let the balancer
@@ -74,10 +90,26 @@ export BUILD_DATE
 # wall-clock time regardless — so two builds of identical content got
 # different config digests, different manifest digests, and every
 # downstream FROM missed. SOURCE_DATE_EPOCH is what pins that field.
-# Measured: without it, two consecutive base builds differed; with it,
-# the image manifest is bit-identical.
-SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct 2>/dev/null || date -u +%s)
-export SOURCE_DATE_EPOCH
+#
+# Per image, not per repo. Taking it from HEAD meant every commit gave
+# the base a new `created`, hence a new digest, hence a full downstream
+# rebuild — even for a commit that only touched the Makefile. Measured:
+# Dockerfile.base unchanged between cf70d3c and 87f539e, yet the base
+# digest moved 91db3c2e -> aa52684f and nothing downstream could hit.
+#
+# Keying each image to the last commit that touched its own Dockerfile
+# means an image's timestamp moves only when its inputs do. These are
+# passed as build args rather than exported, because the arg takes
+# precedence over the environment and bake builds several images in one
+# invocation — one env var cannot describe them all.
+SDE_FALLBACK := $(shell git log -1 --format=%ct 2>/dev/null || date -u +%s)
+sde = $(or $(shell git log -1 --format=%ct -- $(1) 2>/dev/null),$(SDE_FALLBACK))
+SDE_BASE    ?= $(call sde,Dockerfile.base)
+SDE_PYTORCH ?= $(call sde,Dockerfile.pytorch)
+SDE_TRITON  ?= $(call sde,Dockerfile.triton)
+SDE_AITER   ?= $(call sde,Dockerfile.aiter)
+SDE_RUNTIME ?= $(call sde,Dockerfile.runtime)
+export SDE_BASE SDE_PYTORCH SDE_TRITON SDE_AITER SDE_RUNTIME
 
 TELEMETRY ?= 1
 ifeq ($(TELEMETRY),0)
@@ -91,6 +123,7 @@ endif
         builder-snoc-pool builder-status builder-logs builder-restart \
         build-status build-logs build-inspect builder-ensure watch \
         cold-build push-aiter-wheel fetch-aiter-wheel push-wheels \
+        build-torch-wheel build-triton-wheel build-aiter-wheel \
         _build-all _push-all \
         push-torch-wheel fetch-torch-wheel \
         push-triton-wheel fetch-triton-wheel \
@@ -483,7 +516,7 @@ $(BAKE) \
 	--set "*.args.ROCM_VERSION=$(ROCM_VERSION)" \
 	--set "*.args.PYTHON_VERSION=$(PYTHON_VERSION)" \
 	--set "*.args.PYTORCH_ROCM_ARCH=$(PYTORCH_ROCM_ARCH)" \
-	$(2) $(1)
+	$(BAKE_EXTRA) $(2) $(1)
 endef
 
 ##@ Build
@@ -496,6 +529,19 @@ build-pytorch: builder-ensure ## Build PyTorch (depends on base)
 
 build-runtime: builder-ensure ## Build runtime image (depends on pytorch)
 	$(call bake,pytorch-run)
+
+# The wheels had push-only targets. Building one without publishing it
+# is wanted when the registry is unavailable or unwritable — and the
+# benchmark harness needs exactly that, since the credential helper
+# cannot decrypt outside an interactive session.
+build-torch-wheel: builder-ensure ## Build the torch wheel image (no push)
+	$(call bake,pytorch-wheel)
+
+build-triton-wheel: builder-ensure ## Build the Triton wheel image (no push)
+	$(call bake,triton-wheel)
+
+build-aiter-wheel: builder-ensure ## Build the AITER wheel image (no push)
+	$(call bake,aiter-wheel)
 
 # Not offered for the pool. Scheduling across nodes makes every target
 # its own bake invocation, so they cannot hand results to each other
