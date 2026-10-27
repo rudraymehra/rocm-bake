@@ -25,18 +25,25 @@ ARG PYTORCH_ROCM_ARCH=gfx950
 ARG ROCM_VERSION=10.1.0-full
 ARG SCCACHE_WEBDAV_ENDPOINT=http://snoc-strix.fold-leaffish.ts.net:8081
 ARG SCCACHE_SERVER_PORT=4250
+# Empty means "derive from the node"; set it to pin a job count.
+ARG MAX_JOBS=
 
 LABEL org.opencontainers.image.source="https://github.com/triton-lang/triton"
 LABEL org.opencontainers.image.description="Triton built for ROCm ${ROCM_VERSION}, ${PYTORCH_ROCM_ARCH}"
 
-# MAX_JOBS mirrors PyTorch CI; without it triton's cmake serialises more
-# than it needs to on a 32-core node.
-ENV MAX_JOBS=32 \
-    ROCM_PATH=/opt/rocm \
+# MAX_JOBS is computed per node at build time, not fixed here. It was
+# 32, mirroring PyTorch CI, which assumed PyTorch CI's machines: on
+# snoc-strix (32 cores but only 30GB) 32 concurrent cc1plus wanted
+# ~48GB and the OOM killer took the build out at [180/511] with
+# "Killed signal terminated program cc1plus". Cores are the wrong
+# bound — memory is. Set MAX_JOBS explicitly to override the
+# computation; see the build step below.
+ENV ROCM_PATH=/opt/rocm \
     PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
     SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
     SCCACHE_SERVER_PORT=${SCCACHE_SERVER_PORT} \
     SCCACHE_IGNORE_CLIENT_VERSION=1 \
+    SCCACHE_CONF=/etc/sccache.toml \
     CMAKE_C_COMPILER_LAUNCHER=sccache \
     CMAKE_CXX_COMPILER_LAUNCHER=sccache
 
@@ -47,6 +54,15 @@ RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_
     tar xzf /tmp/sccache.tar.gz -C /usr/local/bin --strip-components=1 \
         "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" && \
     rm /tmp/sccache.tar.gz && chmod +x /usr/local/bin/sccache && sccache --version
+
+# Each RUN is a fresh container, so a build step has to start its own
+# sccache server, and startup probes the remote store. That probe is
+# bounded by a 10s timeout compiled into sccache — no environment
+# variable exists for it, only this config file field. Under load on the
+# node hosting the cache, 10s was not enough and the build died with
+# "Timed out waiting for server startup". The backend stays configured
+# by environment; this file carries only the timeout.
+RUN printf 'server_startup_timeout_ms = 60000\n' > /etc/sccache.toml
 
 # Submodules carry the in-tree backends, including amd.
 RUN git clone https://github.com/triton-lang/triton.git /opt/triton && \
@@ -79,7 +95,23 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Triton fetches a prebuilt LLVM matching cmake/llvm-hash.txt unless
 # TRITON_LLVM_DIR points at one; the download dominates the first build.
-RUN python -m build --wheel --no-isolation \
+#
+# MAX_JOBS is derived from the node this lands on rather than fixed:
+# one cc1plus per job at ~2GB each, capped by core count. /proc is the
+# host's here, which is what we want — the balancer picks the node, and
+# this adapts to whichever it picked.
+RUN if [ -z "${MAX_JOBS}" ]; then \
+        cores=$(nproc); \
+        jobs=$(awk '/^MemAvailable:/ {print int($2/1024/1024/2)}' /proc/meminfo); \
+        [ -n "${jobs}" ] || jobs=${cores}; \
+        [ "${jobs}" -ge 1 ] || jobs=1; \
+        [ "${jobs}" -le "${cores}" ] || jobs=${cores}; \
+        export MAX_JOBS=${jobs}; \
+        echo "MAX_JOBS=${MAX_JOBS} (from ${cores} cores, $(awk '/^MemAvailable:/ {printf "%.0fGB", $2/1048576}' /proc/meminfo) available)"; \
+    else \
+        echo "MAX_JOBS=${MAX_JOBS} (pinned via build arg)"; \
+    fi; \
+    python -m build --wheel --no-isolation \
     --outdir /wheels \
     2>&1 | tee /wheels-build.log \
     && sccache --show-stats | tee /wheels-sccache-stats.txt

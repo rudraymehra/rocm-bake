@@ -69,6 +69,16 @@ BUILD_DATE ?= $(shell git log -1 --format=%cI 2>/dev/null || date -u +%Y-%m-%dT%
 export VCS_REF
 export BUILD_DATE
 
+# BUILD_DATE only reaches the `created` LABEL. The image *config* has a
+# `created` field of its own, which BuildKit stamps with nanosecond
+# wall-clock time regardless — so two builds of identical content got
+# different config digests, different manifest digests, and every
+# downstream FROM missed. SOURCE_DATE_EPOCH is what pins that field.
+# Measured: without it, two consecutive base builds differed; with it,
+# the image manifest is bit-identical.
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --format=%ct 2>/dev/null || date -u +%s)
+export SOURCE_DATE_EPOCH
+
 TELEMETRY ?= 1
 ifeq ($(TELEMETRY),0)
 BAKE = docker buildx bake -f bake.hcl

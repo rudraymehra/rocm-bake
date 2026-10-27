@@ -78,6 +78,12 @@ variable "TRITON_REF" {
   default = "675c59878aa2280b31f722aaf42b825fcee21de8"
 }
 
+# Empty means each build derives its own job count from the node it
+# lands on, sized by memory rather than cores. Set it to pin one.
+variable "MAX_JOBS" {
+  default = ""
+}
+
 # Compile AITER's kernel modules at build time rather than leaving them
 # to JIT on first use. See Dockerfile.aiter for what each level excludes.
 variable "PREBUILD_KERNELS" {
@@ -125,6 +131,22 @@ OCI_LABELS = {
 BASE_LABELS = {
   "org.opencontainers.image.source" = SOURCE_URL
 }
+
+# Provenance attestations record build timestamps, so they differ on
+# every build even when the image is byte-identical. Because the
+# attestation shares an OCI index with the image manifest, that changes
+# the digest a downstream FROM pins, and every layer below it misses.
+#
+# Measured: two identical base builds produced indexes fd260117 and
+# 9c5e5112 wrapped around one unchanged image manifest 91db3c2e. A probe
+# RUN missed the cache across those two indexes, while the same digest
+# under a different tag hit.
+#
+# Applied to every image that is a parent or a named context — base,
+# pytorch, triton-wheel — and inherited by pytorch-wheel from pytorch.
+# pytorch-run and aiter-wheel keep their provenance: nothing builds
+# FROM them, so their digests may churn freely.
+NO_PROVENANCE = ["type=provenance,disabled=true"]
 
 # Shared compiler cache on Strix (nginx WebDAV, durable on disk). The
 # name resolves inside a build only because the buildkitd config sets
@@ -206,6 +228,8 @@ target "pytorch-base" {
     PYTHON_VERSION = PYTHON_VERSION
   }
 
+  attest = NO_PROVENANCE
+
   output = ["type=image,compression=zstd"]
 }
 
@@ -253,10 +277,13 @@ target "pytorch" {
     # the port and the strictness toggle are worth overriding here.
     SCCACHE_WEBDAV_ENDPOINT = SCCACHE_WEBDAV_ENDPOINT
     SCCACHE_SERVER_PORT  = SCCACHE_SERVER_PORT
+    MAX_JOBS            = MAX_JOBS
     SCCACHE_VERSION      = SCCACHE_VERSION
     FORCE_RECACHE        = FORCE_RECACHE
     REQUIRE_SCCACHE      = REQUIRE_SCCACHE
   }
+
+  attest = NO_PROVENANCE
 
   output = ["type=image,compression=zstd"]
 }
@@ -314,7 +341,10 @@ target "triton-wheel" {
     SCCACHE_VERSION     = SCCACHE_VERSION
     SCCACHE_WEBDAV_ENDPOINT = SCCACHE_WEBDAV_ENDPOINT
     SCCACHE_SERVER_PORT = SCCACHE_SERVER_PORT
+    MAX_JOBS            = MAX_JOBS
   }
+
+  attest = NO_PROVENANCE
 
   output = ["type=image,compression=zstd"]
 }

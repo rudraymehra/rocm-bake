@@ -51,6 +51,7 @@ ENV PREBUILD_KERNELS=${PREBUILD_KERNELS} \
     SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
     SCCACHE_SERVER_PORT=${SCCACHE_SERVER_PORT} \
     SCCACHE_IGNORE_CLIENT_VERSION=1 \
+    SCCACHE_CONF=/etc/sccache.toml \
     CMAKE_C_COMPILER_LAUNCHER=sccache \
     CMAKE_CXX_COMPILER_LAUNCHER=sccache \
     CMAKE_HIP_COMPILER_LAUNCHER=sccache \
@@ -67,6 +68,15 @@ RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_
     tar xzf /tmp/sccache.tar.gz -C /usr/local/bin --strip-components=1 \
         "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" && \
     rm /tmp/sccache.tar.gz && chmod +x /usr/local/bin/sccache && sccache --version
+
+# Each RUN is a fresh container, so a build step has to start its own
+# sccache server, and startup probes the remote store. That probe is
+# bounded by a 10s timeout compiled into sccache — no environment
+# variable exists for it, only this config file field. Under load on the
+# node hosting the cache, 10s was not enough and the build died with
+# "Timed out waiting for server startup". The backend stays configured
+# by environment; this file carries only the timeout.
+RUN printf 'server_startup_timeout_ms = 60000\n' > /etc/sccache.toml
 
 # AITER's extensions are HIP, so the submodules under 3rdparty are not
 # optional any more than PyTorch's are.
