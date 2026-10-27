@@ -97,7 +97,7 @@ variable "MAX_JOBS" {
 # Compile AITER's kernel modules at build time rather than leaving them
 # to JIT on first use. See Dockerfile.aiter for what each level excludes.
 variable "PREBUILD_KERNELS" {
-  default = "1"
+  default = "2"
 }
 
 variable "AITER_REF" {

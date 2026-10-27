@@ -57,14 +57,26 @@ ARG SCCACHE_WEBDAV_KEY_PREFIX=rocm-pytorch
 # so each build necessarily gets its own server.
 # 0 (upstream default) compiles nothing at package time — kernels are
 # JIT-built on first use, which is why this target finished in 49s and
-# barely touched sccache. 1 compiles the kernel modules for GPU_ARCHS at
-# build time, excluding the _tune modules and limiting MHA to the
-# fmha_v3 forward variants.
+# barely touched sccache. The levels, from setup.py's get_exclude_ops():
+#
+#   1  excludes _tune, and limits MHA to the fmha_v3 forward variants
+#   2  excludes _bwd and _tune
+#   3  keeps only module_fmha_v3*
+#
+# 2 because _bwd is the backward pass — training, not inference, which
+# is all this fleet serves. At level 1 a complete build took 144
+# minutes: ~49 in FlyDSL AOT, ~89 building CK modules, 5 exporting the
+# layer cache. The module phase was dominated by five GEMM modules
+# costing 202 minutes of overlapping compile, so dropping the backward
+# variants cuts work we would never dispatch. Raise it to 1 if anything here is ever trained
+# on, and remember the compiler cache carries over either way: level 2
+# builds a subset of level 1's compiles, so its objects are already
+# populated.
 #
 # GPU_ARCHS below is what makes this safe in a build container: without
 # it AITER falls back to "native" and shells out to rocminfo, which
 # finds no device and raises.
-ARG PREBUILD_KERNELS=1
+ARG PREBUILD_KERNELS=2
 
 # Empty means derive from the node; set it to pin a job count.
 ARG MAX_JOBS=
