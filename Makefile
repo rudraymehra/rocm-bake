@@ -30,6 +30,11 @@ NO_PROXY_LIST := localhost,127.0.0.1,::1,.ts.net,.local,10.0.0.0/8,100.64.0.0/10
 export no_proxy := $(NO_PROXY_LIST)
 export NO_PROXY := $(NO_PROXY_LIST)
 
+# help lives at the bottom of this file, in its own section, so it is
+# no longer the first target. Without this, `make` with no arguments
+# would run whatever target happens to come first.
+.DEFAULT_GOAL := help
+
 # Aliased so the recipe text does not contain the literal $(MAKE):
 # make executes any line referencing $(MAKE) even under -n, which made
 # `make -n watch` launch a full-screen watch instead of printing it.
@@ -128,27 +133,11 @@ endif
         push-torch-wheel fetch-torch-wheel \
         push-triton-wheel fetch-triton-wheel \
         cache-stats cache-summary cache-check cache-logs builder-load \
+        list-vars \
         build-base build-pytorch build-runtime build-all \
         push-base push-pytorch push-runtime push-all \
         clean clean-cache test \
         validate bake-plan setup
-
-help: ## Show this help
-	@printf '\n\033[1mROCm PyTorch Build\033[0m — PyTorch %s on ROCm %s for %s\n' \
-		"$(PYTORCH_VERSION)" "$(ROCM_VERSION)" "$(PYTORCH_ROCM_ARCH)"
-	@printf 'Registry %s · builder %s\n' "$(REGISTRY)" "$(BUILDER)"
-	@printf 'Usage: make <target> [VAR=value]\n'
-	@awk 'BEGIN {FS = ":.*?## "; cmd = "sort"} \
-		/^##@/ { if (insec) close(cmd); printf "\n\033[1m%s\033[0m\n", substr($$0, 5); insec = 1; next } \
-		/^[a-zA-Z_-]+:.*?## / { \
-			name = $$1; text = $$2; \
-			if (substr(text, 1, 2) == "* ") { name = name " *"; text = substr(text, 3) } \
-			line = sprintf("  \033[36m%-20s\033[0m %s", name, text); \
-			if (insec) print line | cmd; else print line } \
-		END { if (insec) close(cmd) }' \
-		$(MAKEFILE_LIST)
-	@printf '\nCommon variables: BUILDER (default %s), REGISTRY, PYTORCH_VERSION,\n' "$(BUILDER)"
-	@printf 'ROCM_VERSION, PYTHON_VERSION, TELEMETRY=0 to skip metrics.\n'
 
 # ─── Zot Registry ────────────────────────────────────────────────
 # zot runs as a bare-metal systemd service on Strix, deployed and owned
@@ -668,3 +657,48 @@ clean-cache: ## Remove cache images from Zot
 
 setup: zot-check builder-setup ## Full setup: check Zot, then builders
 	@echo "Setup complete. Run 'make build-all' to start building."
+
+##@ Help
+
+help: ## Show this help
+	@printf '\n\033[1mROCm PyTorch Build\033[0m — PyTorch %s on ROCm %s for %s\n' \
+		"$(PYTORCH_VERSION)" "$(ROCM_VERSION)" "$(PYTORCH_ROCM_ARCH)"
+	@printf 'Registry %s · builder %s\n' "$(REGISTRY)" "$(BUILDER)"
+	@printf 'Usage: make <target> [VAR=value]\n'
+	@awk 'BEGIN {FS = ":.*?## "; cmd = "sort"} \
+		/^##@/ { if (insec) close(cmd); printf "\n\033[1m%s\033[0m\n", substr($$0, 5); insec = 1; next } \
+		/^[a-zA-Z_-]+:.*?## / { \
+			name = $$1; text = $$2; \
+			if (substr(text, 1, 2) == "* ") { name = name " *"; text = substr(text, 3) } \
+			line = sprintf("  \033[36m%-20s\033[0m %s", name, text); \
+			if (insec) print line | cmd; else print line } \
+		END { if (insec) close(cmd) }' \
+		$(MAKEFILE_LIST)
+	@printf '\n'
+
+list-vars: ## Show the variables these targets read, and their values
+	@printf '\n\033[1mBuild\033[0m\n'
+	@printf '  \033[36m%-24s\033[0m %s\n' PYTORCH_VERSION "$(PYTORCH_VERSION)"
+	@printf '  \033[36m%-24s\033[0m %s\n' ROCM_VERSION "$(ROCM_VERSION)"
+	@printf '  \033[36m%-24s\033[0m %s\n' PYTHON_VERSION "$(PYTHON_VERSION)"
+	@printf '  \033[36m%-24s\033[0m %s\n' PYTORCH_ROCM_ARCH "$(PYTORCH_ROCM_ARCH)"
+	@printf '  \033[36m%-24s\033[0m %s\n' MAX_JOBS "$(if $(MAX_JOBS),$(MAX_JOBS),(derived per node from free memory))"
+	@printf '\n\033[1mWhere things run\033[0m\n'
+	@printf '  \033[36m%-24s\033[0m %s\n' BUILDER "$(BUILDER)"
+	@printf '  \033[36m%-24s\033[0m %s\n' REGISTRY "$(REGISTRY)"
+	@printf '  \033[36m%-24s\033[0m %s\n' REGISTRY_NAME "$(REGISTRY_NAME)"
+	@printf '\n\033[1mCompiler cache\033[0m\n'
+	@printf '  \033[36m%-24s\033[0m %s\n' WEBDAV_HOST "$(WEBDAV_HOST)"
+	@printf '  \033[36m%-24s\033[0m %s\n' SCCACHE_WEBDAV_ENDPOINT "$(SCCACHE_WEBDAV_ENDPOINT)"
+	@printf '  \033[36m%-24s\033[0m %s\n' WEBDAV_DIR "$(WEBDAV_DIR)"
+	@printf '\n\033[1mReproducibility\033[0m  (per image, from its own Dockerfile)\n'
+	@printf '  \033[36m%-24s\033[0m %s\n' SDE_BASE "$(SDE_BASE)  ($(shell date -u -d @$(SDE_BASE) '+%Y-%m-%d %H:%M' 2>/dev/null))"
+	@printf '  \033[36m%-24s\033[0m %s\n' SDE_PYTORCH "$(SDE_PYTORCH)  ($(shell date -u -d @$(SDE_PYTORCH) '+%Y-%m-%d %H:%M' 2>/dev/null))"
+	@printf '  \033[36m%-24s\033[0m %s\n' SDE_TRITON "$(SDE_TRITON)  ($(shell date -u -d @$(SDE_TRITON) '+%Y-%m-%d %H:%M' 2>/dev/null))"
+	@printf '  \033[36m%-24s\033[0m %s\n' SDE_AITER "$(SDE_AITER)  ($(shell date -u -d @$(SDE_AITER) '+%Y-%m-%d %H:%M' 2>/dev/null))"
+	@printf '  \033[36m%-24s\033[0m %s\n' SDE_RUNTIME "$(SDE_RUNTIME)  ($(shell date -u -d @$(SDE_RUNTIME) '+%Y-%m-%d %H:%M' 2>/dev/null))"
+	@printf '\n\033[1mToggles\033[0m\n'
+	@printf '  \033[36m%-24s\033[0m %s\n' TELEMETRY "$(TELEMETRY)  (0 skips metrics collection)"
+	@printf '  \033[36m%-24s\033[0m %s\n' FORCE_RECACHE "$(if $(FORCE_RECACHE),$(FORCE_RECACHE),false)  (true = recompile everything, ignoring sccache)"
+	@printf '  \033[36m%-24s\033[0m %s\n' BAKE_EXTRA "$(if $(BAKE_EXTRA),$(BAKE_EXTRA),(none))"
+	@printf '\nOverride any of these on the command line: make <target> VAR=value\n\n'
