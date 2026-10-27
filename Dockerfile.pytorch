@@ -47,14 +47,17 @@ WORKDIR /opt/pytorch
 # objects and recompiled every GPU kernel, which are the expensive ones.
 # Measured on 0.7.7: 990 of 1003 non-cacheable calls were "-x".
 ARG SCCACHE_VERSION=0.19.0
-RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-    -o /tmp/sccache.tar.gz && \
-    mkdir -p /usr/local/bin && \
-    tar xzf /tmp/sccache.tar.gz -C /usr/local/bin --strip-components=1 \
+# Pinned by content, not just by version tag: a release asset can be
+# replaced after publication, and this binary wraps every compile in
+# the pipeline. ADD --checksum fails the build on mismatch, where curl
+# would happily install whatever it was served.
+ARG SCCACHE_SHA256=aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd
+ADD --checksum=sha256:${SCCACHE_SHA256} \
+    "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    /tmp/sccache.tar.gz
+RUN tar xzf /tmp/sccache.tar.gz -C /usr/local/bin --strip-components=1 \
         "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" && \
-    rm /tmp/sccache.tar.gz && \
-    chmod +x /usr/local/bin/sccache && \
-    sccache --version
+    rm /tmp/sccache.tar.gz && chmod +x /usr/local/bin/sccache && sccache --version
 
 # sccache runs its own server inside this container, backed by the shared
 # WebDAV store on Strix. Three things here are load-bearing:
