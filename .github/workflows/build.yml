@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       rocm_version:
-        description: 'ROCm version (e.g. 7.14, 10.1)'
-        default: '7.14'
+        description: 'ROCm base image tag (e.g. 10.1.0-full)'
+        default: '10.1.0-full'
         required: false
       pytorch_version:
         description: 'PyTorch version (e.g. 2.14.1)'
@@ -36,7 +36,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [pytorch-base, pytorch, pytorch-run, pytorch-test]
+        # pytorch-test is left out: its stage exits 1 without /dev/kfd,
+        # which no build step has (eddc857). make gpu-test covers it.
+        target: [pytorch-base, pytorch, pytorch-run]
     steps:
       - uses: actions/checkout@v4
 
@@ -51,6 +53,9 @@ jobs:
           username: ${{ secrets.REGISTRY_USER }}
           password: ${{ secrets.REGISTRY_PASS }}
 
+      # bake reads REGISTRY, PYTORCH_VERSION, ROCM_VERSION and
+      # PYTORCH_ROCM_ARCH from these env vars (each is a bake variable), so
+      # no --set is needed; the old "target.<name>.args" form was rejected.
       - name: Build ${{ matrix.target }}
         env:
           REGISTRY: ${{ inputs.registry }}
@@ -60,10 +65,6 @@ jobs:
         run: |
           docker buildx bake \
             -f bake.hcl \
-            --set "*.args.REGISTRY=${REGISTRY}" \
-            --set "target.pytorch.args.PYTORCH_VERSION=${PYTORCH_VERSION}" \
-            --set "target.pytorch.args.ROCM_VERSION=${ROCM_VERSION}" \
-            --set "target.pytorch.args.PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}" \
             ${{ matrix.target }}
 
       - name: Push ${{ matrix.target }}
@@ -77,8 +78,4 @@ jobs:
           docker buildx bake \
             -f bake.hcl \
             --push \
-            --set "*.args.REGISTRY=${REGISTRY}" \
-            --set "target.pytorch.args.PYTORCH_VERSION=${PYTORCH_VERSION}" \
-            --set "target.pytorch.args.ROCM_VERSION=${ROCM_VERSION}" \
-            --set "target.pytorch.args.PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}" \
             ${{ matrix.target }}
