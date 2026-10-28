@@ -37,6 +37,11 @@ ARG SCCACHE_WEBDAV_ENDPOINT=http://snoc-strix.fold-leaffish.ts.net:8081
 # deleting a store other projects are still using, and about bounding
 # the blast radius if it ever recurs.
 ARG SCCACHE_WEBDAV_KEY_PREFIX=rocm-pytorch
+# warn is the right default: debug logs every cache lookup, which on a
+# cold triton is 361 compiles' worth of noise. But sccache counts
+# "Cache errors" in its stats without ever logging them at warn, so the
+# only way to see what those are is to raise this for one run.
+ARG SCCACHE_LOG=warn
 # A unix socket, not a TCP port. The builders run with
 # --driver-opt network=host, so SCCACHE_SERVER_PORT is shared by every
 # container on the node. A concurrent vLLM build on snoc-strix held
@@ -74,7 +79,7 @@ ENV ROCM_PATH=/opt/rocm \
     SCCACHE_IGNORE_CLIENT_VERSION=1 \
     SCCACHE_CONF=/etc/sccache.toml \
     SCCACHE_ERROR_LOG=/tmp/sccache-err.log \
-    SCCACHE_LOG=warn \
+    SCCACHE_LOG=${SCCACHE_LOG} \
     CMAKE_C_COMPILER_LAUNCHER=sccache \
     CMAKE_CXX_COMPILER_LAUNCHER=sccache
 
@@ -156,7 +161,7 @@ RUN if [ -z "${MAX_JOBS}" ]; then \
     python -m build --wheel --no-isolation \
     --outdir /wheels \
     2>&1 | tee /wheels-build.log \
-    && sccache --show-stats | tee /wheels-sccache-stats.txt; rc=$?; echo "--- sccache error log: $(wc -c < /tmp/sccache-err.log 2>/dev/null || echo absent) bytes ---"; grep -iE 'error|warn|write' /tmp/sccache-err.log 2>/dev/null | grep -v 'read failed NotFound' | head -40; exit $rc
+    && sccache --show-stats | tee /wheels-triton-sccache-stats.txt; rc=$?; echo "--- sccache error log: $(wc -c < /tmp/sccache-err.log 2>/dev/null || echo absent) bytes ---"; grep -aiE 'cache error|preprocessor failed|cache read error|cache write error|failed to (read|write)' /tmp/sccache-err.log 2>/dev/null | grep -v 'read failed NotFound' | head -60; exit $rc
 
 # triton-kernels as well. AITER's installer takes a local wheelhouse via
 # TRITON_WHEEL_DIR, but only if BOTH triton and triton-kernels are in it
@@ -178,4 +183,4 @@ LABEL org.opencontainers.image.source="https://github.com/triton-lang/triton"
 LABEL org.opencontainers.image.description="Triton wheel for ROCm ${ROCM_VERSION}, ${PYTORCH_ROCM_ARCH}"
 
 COPY --from=builder /wheels/ /wheels/
-COPY --from=builder /wheels-build.log /wheels-sccache-stats.txt /
+COPY --from=builder /wheels-build.log /wheels-triton-sccache-stats.txt /

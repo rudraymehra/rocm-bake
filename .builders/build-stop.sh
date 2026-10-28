@@ -29,10 +29,20 @@ kill_tree() {
 
 [ -s "$PIDFILE" ] || { echo "  nothing from this repo is running"; exit 0; }
 
+# A PID alone is not proof: the file accumulates entries across runs,
+# and the OS reuses numbers. Killing a recycled PID would hit an
+# unrelated process — including, on these shared builders, another
+# project's build. Confirm the command line still looks like ours.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 alive=()
 while read -r pid; do
     [ -n "$pid" ] || continue
-    kill -0 "$pid" 2>/dev/null && alive+=("$pid")
+    kill -0 "$pid" 2>/dev/null || continue
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+    case "$cmd" in
+        *"$REPO"*|*balance.sh*|*telemetry/build.sh*) alive+=("$pid") ;;
+        *) echo "  skipping $pid: not one of ours (pid reused)" ;;
+    esac
 done < "$PIDFILE"
 
 if [ "${#alive[@]}" -eq 0 ]; then

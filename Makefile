@@ -739,4 +739,7 @@ list-vars: ## Show the variables these targets read, and their values
 	@printf '  \033[36m%-24s\033[0m %s\n' TELEMETRY "$(TELEMETRY)  (0 skips metrics collection)"
 	@printf '  \033[36m%-24s\033[0m %s\n' FORCE_RECACHE "$(if $(FORCE_RECACHE),$(FORCE_RECACHE),false)  (true = recompile everything, ignoring sccache)"
 	@printf '  \033[36m%-24s\033[0m %s\n' BAKE_EXTRA "$(if $(BAKE_EXTRA),$(BAKE_EXTRA),(none))"
-	@printf '\nOverride any of these on the command line: make <target> VAR=value\n\n'
+	@printf '  \033[36m%-24s\033[0m %s\n' SCCACHE_LOG "$(if $(SCCACHE_LOG),$(SCCACHE_LOG),warn)  (debug reveals the Cache errors count; env only, see below)"
+	@printf '\nOverride any of these on the command line: make <target> VAR=value\n'
+	@printf 'SCCACHE_LOG is read by bake from the environment, so it needs\n'
+	@printf 'SCCACHE_LOG=debug make <target> rather than make <target> SCCACHE_LOG=debug.\n\n'

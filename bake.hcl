@@ -109,9 +109,15 @@ variable "CACHE_TAG_SUFFIX" {
 }
 
 # Stamped into every BuildKit history record name, so records from one
-# run can be told apart later. Without it a cross-run comparison needs
-# the log files, and the balancer overwrites /tmp/balance-<target>.log
-# on each run — which already cost one measurement.
+# run can be told apart later. The prefix is this repo's name, not the
+# shorter "rpb": the sibling vllm-lmcache project builds on the same
+# nodes, uses the same convention, and builds images with the same
+# names (pytorch, triton, aiter), so a shared prefix made its builds
+# indistinguishable from ours in `make watch`.
+#
+# Without the run id a cross-run comparison needs the log files, and
+# the balancer overwrites /tmp/balance-<target>.log on each run — which
+# already cost one measurement.
 variable "RUN_ID" {
   default = "dev"
 }
@@ -187,6 +193,14 @@ variable "SCCACHE_WEBDAV_ENDPOINT" {
 # the fleet's objects.
 variable "SCCACHE_WEBDAV_KEY_PREFIX" {
   default = "rocm-pytorch"
+}
+
+# sccache's stats report a "Cache errors" count but log nothing about
+# them at warn, so a run that wants to know what they are has to ask
+# for debug. Not the default: debug logs every lookup, and a cold
+# triton does 361 of them.
+variable "SCCACHE_LOG" {
+  default = "warn"
 }
 
 # 0.8.0 is the floor for caching hipcc -x hip; see Dockerfile.pytorch.
@@ -265,7 +279,7 @@ target "pytorch-base" {
   cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/base-cache:latest${CACHE_TAG_SUFFIX},mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true,ignore-error=true"]
 
   args = {
-    BUILDKIT_BUILD_NAME = "rpb/base/${PYTORCH_ROCM_ARCH}/${RUN_ID}"
+    BUILDKIT_BUILD_NAME = "rocm-pytorch-build/base/${PYTORCH_ROCM_ARCH}/${RUN_ID}"
     SOURCE_DATE_EPOCH   = SDE_BASE != "" ? SDE_BASE : null
     ROCM_VERSION   = ROCM_VERSION
     PYTHON_VERSION = PYTHON_VERSION
@@ -305,8 +319,17 @@ target "pytorch" {
   ]
   cache-to = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/pytorch-cache:latest${CACHE_TAG_SUFFIX},mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true,ignore-error=true"]
 
+  # Named context, not a registry ref: bake resolves "target:x" by
+  # building x first and feeding its result straight in, so pytorch is
+  # buildable in one invocation with its inputs. The same pattern as
+  # aiter-wheel below.
+  contexts = {
+    triton-wheels = "target:triton-wheel"
+  }
+
   args = {
-    BUILDKIT_BUILD_NAME = "rpb/pytorch/${PYTORCH_ROCM_ARCH}/${RUN_ID}"
+    TRITON_WHEEL_IMAGE  = "triton-wheels"
+    BUILDKIT_BUILD_NAME = "rocm-pytorch-build/pytorch/${PYTORCH_ROCM_ARCH}/${RUN_ID}"
     SOURCE_DATE_EPOCH   = SDE_PYTORCH != "" ? SDE_PYTORCH : null
     ROCM_VERSION         = ROCM_VERSION
     PYTORCH_VERSION      = PYTORCH_VERSION
@@ -324,6 +347,7 @@ target "pytorch" {
     # the port and the strictness toggle are worth overriding here.
     SCCACHE_WEBDAV_ENDPOINT = SCCACHE_WEBDAV_ENDPOINT
     SCCACHE_WEBDAV_KEY_PREFIX = SCCACHE_WEBDAV_KEY_PREFIX
+    SCCACHE_LOG          = SCCACHE_LOG
     MAX_JOBS            = MAX_JOBS
     SCCACHE_VERSION      = SCCACHE_VERSION
     FORCE_RECACHE        = FORCE_RECACHE
@@ -384,8 +408,7 @@ target "triton-wheel" {
   cache-to   = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/triton-wheel-cache:latest${CACHE_TAG_SUFFIX},mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true,ignore-error=true"]
 
   args = {
-    BUILDKIT_BUILD_NAME = "rpb/triton-wheel/${PYTORCH_ROCM_ARCH}/${RUN_ID}"
-    BUILDKIT_BUILD_NAME = "rpb/torch-wheel/${PYTORCH_ROCM_ARCH}/${RUN_ID}"
+    BUILDKIT_BUILD_NAME = "rocm-pytorch-build/triton-wheel/${PYTORCH_ROCM_ARCH}/${RUN_ID}"
     SOURCE_DATE_EPOCH   = SDE_TRITON != "" ? SDE_TRITON : null
     BASE_IMAGE          = "${REGISTRY}/${REGISTRY_NAME}/base:${ROCM_VERSION}-${PYTHON_VERSION}"
     TRITON_REF          = TRITON_REF
@@ -394,6 +417,7 @@ target "triton-wheel" {
     SCCACHE_VERSION     = SCCACHE_VERSION
     SCCACHE_WEBDAV_ENDPOINT = SCCACHE_WEBDAV_ENDPOINT
     SCCACHE_WEBDAV_KEY_PREFIX = SCCACHE_WEBDAV_KEY_PREFIX
+    SCCACHE_LOG         = SCCACHE_LOG
     MAX_JOBS            = MAX_JOBS
   }
 
@@ -442,7 +466,7 @@ target "aiter-wheel" {
   }
 
   args = {
-    BUILDKIT_BUILD_NAME = "rpb/aiter-wheel/${PYTORCH_ROCM_ARCH}/${RUN_ID}"
+    BUILDKIT_BUILD_NAME = "rocm-pytorch-build/aiter-wheel/${PYTORCH_ROCM_ARCH}/${RUN_ID}"
     SOURCE_DATE_EPOCH   = SDE_AITER != "" ? SDE_AITER : null
     PYTORCH_IMAGE       = "pytorch-img"
     TRITON_WHEEL_IMAGE  = "triton-wheels"
@@ -482,7 +506,7 @@ target "pytorch-run" {
   cache-to = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/runtime-cache:latest${CACHE_TAG_SUFFIX},mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true,ignore-error=true"]
 
   args = {
-    BUILDKIT_BUILD_NAME = "rpb/runtime/${PYTORCH_ROCM_ARCH}/${RUN_ID}"
+    BUILDKIT_BUILD_NAME = "rocm-pytorch-build/runtime/${PYTORCH_ROCM_ARCH}/${RUN_ID}"
     SOURCE_DATE_EPOCH   = SDE_RUNTIME != "" ? SDE_RUNTIME : null
     PYTHON_VERSION = PYTHON_VERSION
   }

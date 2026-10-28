@@ -76,6 +76,31 @@ def image_key(name):
     return (len(IMAGE_ORDER), name)
 
 
+# An allowlist on top of the prefix, not the prefix alone. The prefix
+# started as "rpb/", which the sibling vllm-lmcache project also used —
+# it named the convention rather than the project, and filtering on it
+# listed vllm, lmcache and nixl-wheel as ours. Renaming it to
+# "rocm-pytorch-build/" fixes that for new records, but the allowlist
+# stays: it is what keeps a future collision from costing the panel.
+OUR_IMAGES = {
+    "base", "pytorch", "triton", "aiter", "runtime",
+    "torch-wheel", "triton-wheel", "aiter-wheel",
+}
+
+
+def ours(raw):
+    """This repo's image name from a history record, or None."""
+    if not raw.startswith("rocm-pytorch-build/"):
+        return None
+    rest = raw[len("rocm-pytorch-build/"):]
+    # Current form is <image>/<arch>/<run-id>; older records are
+    # Dockerfile.<image> (<stage>) and predate BUILDKIT_BUILD_NAME.
+    name = (rest.split("/")[0] if "/" in rest
+            else rest.replace("Dockerfile.", "").replace(" (final)", ""))
+    stem = name.split(" ")[0]
+    return name if stem in OUR_IMAGES else None
+
+
 def records_for(builder):
     """Raw history records for one builder, newest first."""
     try:
@@ -115,13 +140,20 @@ def by_image(builders):
     for builder in builders:
         for rec in records_for(builder):
             raw = rec.get("name") or ""
-            # The builders are shared. Without this the summary lists
-            # vllm-lmcache's images, and every throwaway build anyone
-            # ran on the node, as though they were ours.
-            if not raw.startswith("rocm-pytorch-build/"):
+            # Two naming schemes, because BUILDKIT_BUILD_NAME now sets
+            # the record name explicitly:
+            #   rocm-pytorch-build/<image>/<arch>/<run-id>   (current)
+            #   rocm-pytorch-build/Dockerfile.<image> (<stage>)
+            # Older records predate that and still use the second form;
+            # dropping them would blank the panel for 12h after the
+            # change, and filtering on the old prefix alone silently
+            # hid every new build.
+            #
+            # The builders are shared, so anything matching neither —
+            # vllm-lmcache's images, throwaway builds — is skipped.
+            name = ours(raw)
+            if name is None:
                 continue
-            name = raw.replace("rocm-pytorch-build/", "")
-            name = name.replace("Dockerfile.", "")
             # The parenthetical is the Dockerfile stage. "final" is the
             # shipped image, so naming it adds nothing — whereas
             # "(wheel)" distinguishes a second image built from the same

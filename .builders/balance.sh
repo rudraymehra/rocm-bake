@@ -57,7 +57,13 @@ MIN_MEM_GB="${MIN_MEM_GB:-8}"
 # e.g. STAGE_3="pytorch-wheel" to build a new arch without AITER, which
 # costs more than everything else combined.
 STAGE_1="${STAGE_1:-pytorch-base}"
-STAGE_2="${STAGE_2:-pytorch triton-wheel}"
+# triton-wheel before pytorch, not beside it: the pytorch image now
+# installs our triton wheel, so it needs that target's result. They
+# used to run concurrently on two nodes; this costs triton's duration
+# on the critical path (~90s once its cache is warm, since the build is
+# architecture-independent and hits 100%).
+STAGE_2="${STAGE_2:-triton-wheel}"
+STAGE_2B="${STAGE_2B:-pytorch}"
 # pytorch-run omitted: no node has a working GPU, so the runtime image
 # cannot be exercised and is not worth a slot. Add it back here when
 # one does.
@@ -196,7 +202,7 @@ if [ "$BEST_ONLY" = 1 ]; then
     exit 0
 fi
 
-for stage in "$STAGE_1" "$STAGE_2" "$STAGE_3"; do
+for stage in "$STAGE_1" "$STAGE_2" "$STAGE_2B" "$STAGE_3"; do
     run_stage "$stage" || { echo "balance: stage failed: $stage" >&2; exit 1; }
 done
 

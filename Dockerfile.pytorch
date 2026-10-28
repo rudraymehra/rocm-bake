@@ -3,7 +3,16 @@
 # Builds PyTorch with HIP support optimized for RDNA3/4 architecture
 # Requires PyTorch 2.14.0+ and ROCm 10.1+
 
+# Both ARGs before the first FROM: an ARG declared after a FROM belongs
+# to that stage, and a later `FROM ${X}` then sees it blank. This file,
+# Dockerfile.base and Dockerfile.runtime have each been broken by that
+# rule before.
+ARG TRITON_WHEEL_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/triton-wheel:latest
 ARG BASE_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/base:10.1.0-full-3.14
+
+# Our ROCm 10.1 triton, installed into the shipped image below.
+FROM ${TRITON_WHEEL_IMAGE} AS tritonwheels
+
 FROM ${BASE_IMAGE} AS builder
 
 # ─── PyTorch source checkout ─────────────────────────────────────
@@ -114,13 +123,16 @@ ARG MAX_JOBS=
 # Memory budget per compile job, used to derive MAX_JOBS. 2GB is
 # measured for cc1plus: triton died at 32 jobs on a 30GB node.
 ARG MEM_PER_JOB_GB=2
+# See Dockerfile.triton: raise to debug for one run to find out what
+# sccache's "Cache errors" counter is actually counting.
+ARG SCCACHE_LOG=warn
 ENV SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
     SCCACHE_SERVER_UDS=/tmp/sccache.sock \
     SCCACHE_WEBDAV_KEY_PREFIX=${SCCACHE_WEBDAV_KEY_PREFIX} \
     SCCACHE_IGNORE_CLIENT_VERSION=1 \
     SCCACHE_CONF=/etc/sccache.toml \
     SCCACHE_ERROR_LOG=/tmp/sccache-err.log \
-    SCCACHE_LOG=warn \
+    SCCACHE_LOG=${SCCACHE_LOG} \
     CMAKE_C_COMPILER_LAUNCHER=sccache \
     CMAKE_CXX_COMPILER_LAUNCHER=sccache \
     CMAKE_HIP_COMPILER_LAUNCHER=sccache
@@ -252,7 +264,7 @@ RUN if [ "${FORCE_RECACHE}" = "true" ] || [ "${FORCE_RECACHE}" = "1" ]; then \
     python -m build --wheel --no-isolation \
     --outdir /opt/pytorch/dist \
     2>&1 | tee /opt/pytorch/build.log \
-    && sccache --show-stats | tee /opt/pytorch/sccache-stats.txt; rc=$?; echo "--- sccache error log: $(wc -c < /tmp/sccache-err.log 2>/dev/null || echo absent) bytes ---"; grep -iE 'error|warn|write' /tmp/sccache-err.log 2>/dev/null | grep -v 'read failed NotFound' | head -40; exit $rc
+    && sccache --show-stats | tee /opt/pytorch/sccache-stats.txt; rc=$?; echo "--- sccache error log: $(wc -c < /tmp/sccache-err.log 2>/dev/null || echo absent) bytes ---"; grep -aiE 'cache error|preprocessor failed|cache read error|cache write error|failed to (read|write)' /tmp/sccache-err.log 2>/dev/null | grep -v 'read failed NotFound' | head -60; echo "--- cache misses, first 40 (debug only) ---"; grep -aoE '\[[^]]+\]: Cache miss' /tmp/sccache-err.log 2>/dev/null | head -40; exit $rc
 
 SHELL ["/bin/sh", "-c"]
 
@@ -306,6 +318,21 @@ RUN pip install --no-cache-dir /opt/pytorch/dist/*.whl \
 # The extras are genuinely optional, so they alone get the tolerance.
 RUN pip install --no-cache-dir torchaudio torchdata torchvision \
     2>&1 | tee /var/log/pytorch-build/install.log || true
+
+# Triton, from our own wheel rather than PyPI. A source-built torch
+# wheel declares no triton dependency — upstream's published ROCm
+# wheels list pytorch-triton-rocm in Requires-Dist, but that is added
+# by their release packaging, not by the build — so `pip install torch`
+# pulls nothing and torch.compile fails with "Cannot find a working
+# triton installation". AMD's published triton also stops at ROCm 7.2,
+# which is why we build our own.
+#
+# --no-deps: the wheel's own dependencies are already satisfied, and
+# letting pip resolve them here risks pulling a CUDA torch from PyPI.
+COPY --from=tritonwheels /wheels/ /tmp/triton-wheels/
+RUN pip install --no-cache-dir --no-deps /tmp/triton-wheels/*.whl \
+    && rm -rf /tmp/triton-wheels \
+    && python -c "import triton; print('installed triton', triton.__version__)"
 
 # Clean build artifacts
 RUN rm -rf /opt/pytorch

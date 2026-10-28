@@ -224,7 +224,7 @@ RUN if [ -z "${MAX_JOBS}" ]; then \
     fi; \
     python setup.py bdist_wheel --dist-dir=/wheels \
     2>&1 | tee /wheels-build.log \
-    && sccache --show-stats | tee /wheels-sccache-stats.txt
+    && sccache --show-stats | tee /wheels-aiter-sccache-stats.txt
 
 SHELL ["/bin/sh", "-c"]
 
@@ -240,4 +240,4 @@ LABEL org.opencontainers.image.source="https://github.com/ROCm/aiter"
 LABEL org.opencontainers.image.description="AITER wheel for ${PYTORCH_ROCM_ARCH}"
 
 COPY --from=builder /wheels/ /wheels/
-COPY --from=builder /wheels-build.log /wheels-sccache-stats.txt /
+COPY --from=builder /wheels-build.log /wheels-aiter-sccache-stats.txt /
