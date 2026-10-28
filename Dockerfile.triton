@@ -57,6 +57,10 @@ ARG SCCACHE_LOG=warn
 # so each build necessarily gets its own server.
 # Empty means "derive from the node"; set it to pin a job count.
 ARG MAX_JOBS=
+# true forces every compile to run and repopulate, as in Dockerfile.pytorch
+# (make cold-build). Not named SCCACHE_RECACHE: sccache tests that name for
+# presence, so declaring it as an ARG would force recache on every build.
+ARG FORCE_RECACHE=false
 # Memory budget per compile job, used to derive MAX_JOBS. 2GB is
 # measured for cc1plus: triton died at 32 jobs on a 30GB node.
 ARG MEM_PER_JOB_GB=2
@@ -147,7 +151,13 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # one cc1plus per job at ~2GB each, capped by core count. /proc is the
 # host's here, which is what we want — the balancer picks the node, and
 # this adapts to whichever it picked.
-RUN if [ -z "${MAX_JOBS}" ]; then \
+RUN if [ "${FORCE_RECACHE}" = "true" ] || [ "${FORCE_RECACHE}" = "1" ]; then \
+        export SCCACHE_RECACHE=1; \
+        echo "sccache: forced recache ON — cache reads disabled for this build"; \
+    else \
+        echo "sccache: normal mode — cache reads enabled"; \
+    fi; \
+    if [ -z "${MAX_JOBS}" ]; then \
         cores=$(nproc); \
         jobs=$(awk -v per="${MEM_PER_JOB_GB}" '/^MemAvailable:/ {print int($2/1024/1024/per)}' /proc/meminfo); \
         [ -n "${jobs}" ] || jobs=${cores}; \
