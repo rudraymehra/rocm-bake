@@ -1,0 +1,58 @@
+# Temporary proof run for gpu-test.sh. Not part of any PR.
+name: proofs-gpu-test
+on: push
+jobs:
+  gpu-test-script:
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2
+        ports: ["5000:5000"]
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: run gpu-test.sh before and after, GPU devices stripped, stub probe
+        run: |
+          set -u
+          git fetch -q origin main
+          # docker wrapper: identical to docker except --device flags are dropped (no GPU here)
+          mkdir -p /tmp/bin
+          printf '#!/bin/bash\na=()\nfor x in "$@"; do case "$x" in --device=*) ;; *) a+=("$x") ;; esac; done\nexec /usr/bin/docker "${a[@]}"\n' > /tmp/bin/docker
+          chmod +x /tmp/bin/docker
+          # stub probe: which image is this, and is triton importable
+          stub='import os, importlib.util as u, sys; print("PROBE image=" + open("/marker").read().strip() + " triton=" + ("yes" if u.find_spec("triton") else "MISSING")); sys.exit(0 if u.find_spec("triton") else 1)'
+          setup() { # setup <ref>: the script at <ref> next to the stub probe
+            rm -rf /tmp/gt && mkdir -p /tmp/gt
+            git show "$1:.builders/gpu-test.sh" > /tmp/gt/gpu-test.sh
+            echo "$stub" > /tmp/gt/gpu-probe.py
+          }
+          gt() { REGISTRY=localhost:5000 PATH=/tmp/bin:$PATH bash /tmp/gt/gpu-test.sh "$@" 2>&1 | grep -E "PROBE|GPU test|cannot pull|invalid reference" | tr '\n' ' '; }
+          R=localhost:5000/rocm-pytorch
+          # a dummy triton wheel, and the triton-wheel image (FROM scratch, /wheels)
+          mkdir -p /tmp/tw/triton && echo "" > /tmp/tw/triton/__init__.py
+          printf '[project]\nname="triton"\nversion="3.8.0"\n[build-system]\nrequires=["setuptools"]\nbuild-backend="setuptools.build_meta"\n' > /tmp/tw/pyproject.toml
+          pip wheel -q -w /tmp/tw/dist /tmp/tw
+          mkdir -p /tmp/twi/wheels && cp /tmp/tw/dist/*.whl /tmp/twi/wheels/
+          printf 'FROM scratch\nCOPY wheels /wheels\n' > /tmp/twi/Dockerfile
+          img() { # img <tag> <marker> <with-triton 0|1>
+            d=$(mktemp -d); cp /tmp/tw/dist/*.whl "$d/"
+            { echo "FROM python:3.12-slim"; echo "RUN echo $2 > /marker"; echo "COPY *.whl /tmp/"
+              [ "$3" = 1 ] && echo "RUN pip install -q /tmp/*.whl"; } > "$d/Dockerfile"
+            docker build -q -t "$1" "$d" > /dev/null && docker push -q "$1" > /dev/null
+          }
+          docker build -q -t $R/triton-wheel:10.1.0-full-gfx950 /tmp/twi > /dev/null && docker push -q $R/triton-wheel:10.1.0-full-gfx950 > /dev/null
+
+          echo "== 1. image without triton (the regression 0714318 fixed): does the test notice?"
+          img $R/pytorch:2.14.1-10.1.0-full-gfx950 no-triton-image 0
+          for ref in origin/main HEAD; do setup $ref; echo "RESULT [$ref] $(gt --arch gfx950)"; done
+
+          echo "== 2. multi-arch build gfx942;gfx950 (bake tags it gfx942_gfx950)"
+          img $R/pytorch:2.14.1-10.1.0-full-gfx942_gfx950 multiarch-image 1
+          for ref in origin/main HEAD; do setup $ref; echo "RESULT [$ref] $(gt --arch 'gfx942;gfx950')"; done
+
+          echo "== 3. registry unreachable, an older copy of the tag cached locally"
+          img $R/pytorch:2.14.1-10.1.0-full-gfx950 OLD-image 1
+          docker pull -q $R/pytorch:2.14.1-10.1.0-full-gfx950 > /dev/null
+          img $R/pytorch:2.14.1-10.1.0-full-gfx950 NEW-image 1
+          docker stop "$(docker ps -q --filter ancestor=registry:2)" > /dev/null
+          for ref in origin/main HEAD; do setup $ref; echo "RESULT [$ref] $(gt --arch gfx950)"; done
