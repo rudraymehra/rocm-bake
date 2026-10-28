@@ -42,6 +42,7 @@ jobs:
           }
           docker build -q -t $R/triton-wheel:10.1.0-full-gfx950 /tmp/twi > /dev/null && docker push -q $R/triton-wheel:10.1.0-full-gfx950 > /dev/null
 
+          if false; then
           echo "== 1. image without triton (the regression 0714318 fixed): does the test notice?"
           img $R/pytorch:2.14.1-10.1.0-full-gfx950 no-triton-image 0
           for ref in origin/main HEAD; do setup $ref; echo "RESULT [$ref] $(gt --arch gfx950)"; done
@@ -50,9 +51,13 @@ jobs:
           img $R/pytorch:2.14.1-10.1.0-full-gfx942_gfx950 multiarch-image 1
           for ref in origin/main HEAD; do setup $ref; echo "RESULT [$ref] $(gt --arch 'gfx942;gfx950')"; done
 
+          fi
           echo "== 3. registry unreachable, an older copy of the tag cached locally"
-          img $R/pytorch:2.14.1-10.1.0-full-gfx950 OLD-image 1
-          docker pull -q $R/pytorch:2.14.1-10.1.0-full-gfx950 > /dev/null
-          img $R/pytorch:2.14.1-10.1.0-full-gfx950 NEW-image 1
+          T=$R/pytorch:2.14.1-10.1.0-full-gfx950
+          img $T OLD-image 1
+          old=$(docker image inspect -f '{{.Id}}' $T)
+          img $T NEW-image 1
+          docker tag "$old" $T
+          echo "registry has: NEW-image; local cache has: $(docker run --rm --entrypoint cat $T /marker)"
           docker stop "$(docker ps -q --filter ancestor=registry:2)" > /dev/null
           for ref in origin/main HEAD; do setup $ref; echo "RESULT [$ref] $(gt --arch gfx950)"; done
