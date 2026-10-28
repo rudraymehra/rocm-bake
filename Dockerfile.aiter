@@ -80,6 +80,10 @@ ARG PREBUILD_KERNELS=2
 
 # Empty means derive from the node; set it to pin a job count.
 ARG MAX_JOBS=
+# true forces every compile to run and repopulate, as in Dockerfile.pytorch
+# (make cold-build). Not named SCCACHE_RECACHE: sccache tests that name for
+# presence, so declaring it as an ARG would force recache on every build.
+ARG FORCE_RECACHE=false
 # AITER's kernel compiles are far lighter than cc1plus: measured 4.178GB
 # across 12 jobs on snoc-strix, about 357MB each. The 2GB default used
 # for pytorch and triton would cap this node at 12 of its 32 cores for
@@ -211,7 +215,13 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # is our case: they pass the device flags conditionally and keep
 # PREBUILD_KERNELS=1 either way. GPU_ARCHS is what keeps setup.py from
 # shelling out to rocminfo to detect the target.
-RUN if [ -z "${MAX_JOBS}" ]; then \
+RUN if [ "${FORCE_RECACHE}" = "true" ] || [ "${FORCE_RECACHE}" = "1" ]; then \
+        export SCCACHE_RECACHE=1; \
+        echo "sccache: forced recache ON — cache reads disabled for this build"; \
+    else \
+        echo "sccache: normal mode — cache reads enabled"; \
+    fi; \
+    if [ -z "${MAX_JOBS}" ]; then \
         cores=$(nproc); \
         jobs=$(awk -v per="${MEM_PER_JOB_GB}" '/^MemAvailable:/ {print int($2/1024/1024/per)}' /proc/meminfo); \
         [ -n "${jobs}" ] || jobs=${cores}; \
