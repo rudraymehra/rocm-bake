@@ -58,9 +58,21 @@ jobs:
 
       - name: Read current versions from bake.hcl
         id: current
+        # The default sits on its own line inside the variable block, so a
+        # grep for the name and "default" on one line finds nothing. ROCm
+        # releases are tagged rocm-<major>.<minor>[.<patch>], while the
+        # default is an image tag such as 10.1.0-full: compare major.minor.
         run: |
-          PYTORCH=$(grep 'default = "' bake.hcl | grep PYTORCH_VERSION -m1 | sed 's/.*default = "\([^"]*\)".*/\1/')
-          ROCM=$(grep 'default = "' bake.hcl | grep ROCM_VERSION -m1 | sed 's/.*default = "\([^"]*\)".*/\1/')
+          default_of() {
+            awk -v v="variable \"$1\"" 'index($0, v) == 1 { f = 1 }
+              f && /default *=/ { match($0, /"[^"]*"/); print substr($0, RSTART + 1, RLENGTH - 2); exit }' bake.hcl
+          }
+          PYTORCH=$(default_of PYTORCH_VERSION)
+          ROCM_TAG=$(default_of ROCM_VERSION)
+          ROCM=$(printf '%s' "$ROCM_TAG" | grep -oE '^[0-9]+\.[0-9]+')
+          if [ -z "$PYTORCH" ] || [ -z "$ROCM" ]; then
+            echo "::error::could not read PYTORCH_VERSION or ROCM_VERSION from bake.hcl"; exit 1
+          fi
           echo "pytorch=$PYTORCH" >> "$GITHUB_OUTPUT"
           echo "rocm=$ROCM" >> "$GITHUB_OUTPUT"
 
@@ -94,7 +106,7 @@ jobs:
             const rocmUpdated = '${{ steps.report.outputs.rocm_updated }}' === 'true';
 
             let title = '[update] PyTorch ROCm version(s) available';
-            if (pytorchUpdated) title += `, PyTorch ${{ steps.pytorch.outputs.version }} -> ${{ steps.current.outputs.pytorch }}`;
+            if (pytorchUpdated) title += `, PyTorch ${{ steps.current.outputs.pytorch }} -> ${{ steps.pytorch.outputs.version }}`;
             if (rocmUpdated) title += `, ROCm ${{ steps.rocm.outputs.tag }}`;
 
             const lines = [
@@ -107,6 +119,19 @@ jobs:
               '',
               'Update `bake.hcl` variables `PYTORCH_VERSION` and/or `ROCM_VERSION` to pull the new default.'
             ];
+
+            // One open issue at a time: the check runs weekly and would
+            // otherwise file the same report again every Monday.
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'version-update',
+            });
+            if (open.length > 0) {
+              core.notice(`Already reported in #${open[0].number}`);
+              return;
+            }
 
             await github.rest.issues.create({
               owner: context.repo.owner,
