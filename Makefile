@@ -62,7 +62,10 @@ WEBDAV_URL  ?= http://$(WEBDAV_HOST):$(WEBDAV_PORT)
 # That hit both reads and writes — 79 of 361 compiles in one triton
 # build — so objects were recompiled and then thrown away. The name
 # stays the configuration surface; only the containers see an address.
-WEBDAV_IP   ?= $(shell getent hosts $(WEBDAV_HOST) 2>/dev/null | awk '{print $$1; exit}')
+# ahostsv4, not hosts: getent hosts returns the AAAA record first when
+# there is one (tailnet names have both), and a bare IPv6 address makes
+# http://<addr>:<port> unparseable. The store listens on IPv4 only.
+WEBDAV_IP   ?= $(shell getent ahostsv4 $(WEBDAV_HOST) 2>/dev/null | awk '{print $$1; exit}')
 SCCACHE_WEBDAV_ENDPOINT ?= http://$(or $(WEBDAV_IP),$(WEBDAV_HOST)):$(WEBDAV_PORT)
 export SCCACHE_WEBDAV_ENDPOINT
 WEBDAV_DIR  ?= /var/cache/sccache-webdav
