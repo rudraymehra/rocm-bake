@@ -59,7 +59,7 @@ print(f"  {torch.cuda.get_device_name(0)}  {gfx}  "
 
 want = os.environ.get("EXPECT_ARCH", "")
 if want:
-    check("device arch matches the wheel", gfx == want,
+    check("device arch matches the wheel", gfx in want.split(";"),
           f"built {want}, found {gfx}")
 check("arch in wheel's arch list", gfx in torch.cuda.get_arch_list(),
       str(torch.cuda.get_arch_list()))
@@ -94,13 +94,19 @@ except Exception as exc:  # noqa: BLE001
 # ── autograd ─────────────────────────────────────────────────────
 section("autograd")
 try:
+    # Against the same gradient on the CPU: finite alone also passes a
+    # backward pass that returns zeros. Relative, so reduced-precision
+    # fp32 matmul on the GPU still passes.
     w = torch.randn(256, 256, device="cuda", requires_grad=True)
-    y = (w @ w.T).sum()
-    y.backward()
-    check("backward produces finite grads",
-          w.grad is not None and torch.isfinite(w.grad).all().item())
+    (w @ w.T).sum().backward()
+    wc = w.detach().cpu().requires_grad_()
+    (wc @ wc.T).sum().backward()
+    err = (w.grad.cpu() - wc.grad).abs().max().item()
+    scale = wc.grad.abs().max().item()
+    check("backward matches CPU", err <= 1e-3 * scale,
+          f"max abs err {err:.2e} of {scale:.2e}")
 except Exception as exc:  # noqa: BLE001
-    check("backward produces finite grads", False, repr(exc)[:70])
+    check("backward matches CPU", False, repr(exc)[:70])
 
 # ── a real training step ─────────────────────────────────────────
 section("training step")
@@ -121,7 +127,9 @@ try:
         if step == 0:
             first = loss.item()
         last = loss.item()
-    check("loss decreases over 20 steps", last < first,
+    # Halved, not merely lower: with zero gradients AdamW's weight decay
+    # alone still nudges the loss down in the third decimal.
+    check("loss decreases over 20 steps", last < 0.5 * first,
           f"{first:.3f} -> {last:.3f}")
 except Exception as exc:  # noqa: BLE001
     check("loss decreases over 20 steps", False, repr(exc)[:70])
@@ -153,8 +161,14 @@ try:
                 got = torch.nn.functional.scaled_dot_product_attention(q, q, q)
             err = (got.float() - base.float()).abs().max().item()
             check(f"sdpa {label}", err < 5e-2, f"max abs err {err:.2e}")
-        except Exception:  # noqa: BLE001
-            check(f"sdpa {label}", None, "unavailable on this arch")
+        except Exception as exc:  # noqa: BLE001
+            # Only PyTorch's "no kernel for this input/arch" is a skip
+            # ("No available kernel. Aborting execution." in v2.14.1); a
+            # kernel that exists and then fails to launch is a failure.
+            if "No available kernel" in str(exc) or "No viable backend" in str(exc):
+                check(f"sdpa {label}", None, "unavailable on this arch")
+            else:
+                check(f"sdpa {label}", False, repr(exc)[:70])
 except Exception as exc:  # noqa: BLE001
     check("sdpa", False, repr(exc)[:70])
 
