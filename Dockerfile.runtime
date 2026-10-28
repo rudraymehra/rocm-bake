@@ -12,6 +12,8 @@ ARG ROCM_VERSION=10.1.0-full
 # suggests. Trimming it properly means installing just the ROCm runtime
 # packages onto plain ubuntu rather than taking the full SDK.
 ARG RUNTIME_BASE_IMAGE=rocm/dev-ubuntu-26.04:${ROCM_VERSION}
+# The tag is in the ARG above, which hadolint does not expand.
+# hadolint ignore=DL3006
 FROM ${RUNTIME_BASE_IMAGE} AS base
 
 # Re-declared inside the stage. ARGs before the first FROM live in the

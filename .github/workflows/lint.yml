@@ -47,7 +47,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: hadolint
-        uses: hadolint/hadolint-action@v3.1.0
+        # v3.5.0 bundles hadolint 2.15.1. v3.1.0's 2.12.0 cannot parse
+        # ADD --checksum and stopped at "invalid flag: --checksum".
+        uses: hadolint/hadolint-action@v3.5.0
         with:
           recursive: true
           dockerfile: "Dockerfile.*"
@@ -96,6 +98,6 @@ jobs:
           # E,F only — pyflakes and the pycodestyle errors. The wider
           # default set flags blind excepts and loop-variable capture
           # that are deliberate in the probe and telemetry scripts.
-          ruff check --select E,F $(git ls-files '*.py')
+          git ls-files -z '*.py' | xargs -0 ruff check --select E,F
       - name: compile
-        run: python -m py_compile $(git ls-files '*.py')
+        run: git ls-files -z '*.py' | xargs -0 python -m py_compile
