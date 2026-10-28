@@ -1,0 +1,115 @@
+name: Lint & spelling
+
+# Deliberately cheap: everything here runs on a bare ubuntu runner in
+# under a minute, with no Docker and no registry access, so it can gate
+# every pull request without competing for the build fleet. The heavier
+# Dockerfile and bake validation lives in ci.yml.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  spelling:
+    name: Spelling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: codespell
+        uses: codespell-project/actions-codespell@v2
+        with:
+          # Configuration lives in .codespellrc so a local `codespell`
+          # run and CI agree; see the ignore list there for why ROCm
+          # vocabulary needs exemptions.
+          skip: .git,*.lock,dist,telemetry/out,*.prom,*.log,.claude
+          ignore_words_list: hsa,copys,re-declare,re-declared
+
+  shell:
+    name: Shell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          # -S warning: style notes on these scripts are mostly about
+          # quoting preferences that would churn working code. Warnings
+          # and above are the ones that catch real bugs.
+          mapfile -t scripts < <(git ls-files '*.sh')
+          printf '  %s\n' "${scripts[@]}"
+          shellcheck -S warning "${scripts[@]}"
+
+  dockerfiles:
+    name: Dockerfiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: hadolint
+        run: |
+          # Run the image directly rather than hadolint-action: the
+          # version that action pins predates `ADD --checksum=`, and
+          # reports it as "invalid flag" on three of these Dockerfiles.
+          #
+          # Each ignore is a false positive for how this repo builds,
+          # not a deferred fix:
+          #   DL3008/DL3013  pinning every apt and pip version is not
+          #                  practical when the base moves with ROCm
+          #   DL3059         consecutive RUNs are deliberate, to put
+          #                  layer boundaries where the cache wants them
+          #   DL3003         `cd x && ...` inside RUN is load-bearing;
+          #                  WORKDIR would change the layer semantics
+          #   DL4006         the one piped RUN outside pipefail is the
+          #                  optional-extras install, which carries an
+          #                  explicit `|| true`. The build pipelines are
+          #                  covered by a SHELL ... -o pipefail above them
+          #   DL3022         `COPY --from=pytorch` resolves through a
+          #                  bake named context, invisible to hadolint
+          #   DL3006         the base image tag comes from an ARG
+          rc=0
+          for f in Dockerfile.*; do
+            printf '== %s\n' "$f"
+            docker run --rm -i hadolint/hadolint:latest hadolint \
+              --failure-threshold warning \
+              --ignore DL3008 --ignore DL3013 --ignore DL3059 \
+              --ignore DL3003 --ignore DL4006 --ignore DL3022 \
+              --ignore DL3006 \
+              - < "$f" || rc=1
+          done
+          exit $rc
+
+  workflows:
+    name: Workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        uses: raven-actions/actionlint@v2
+        with:
+          fail-on-error: true
+      - name: yamllint
+        run: |
+          pipx install yamllint
+          yamllint -c .yamllint.yml .github/
+
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: ruff
+        run: |
+          pipx install ruff
+          # E,F only — pyflakes and the pycodestyle errors. The wider
+          # default set flags blind excepts and loop-variable capture
+          # that are deliberate in the probe and telemetry scripts.
+          mapfile -t pyfiles < <(git ls-files '*.py')
+          ruff check --select E,F "${pyfiles[@]}"
+      - name: compile
+        run: |
+          mapfile -t pyfiles < <(git ls-files '*.py')
+          python -m py_compile "${pyfiles[@]}"

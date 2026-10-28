@@ -33,9 +33,9 @@ jobs:
 
       - name: Validate bake.hcl target syntax
         run: |
-          docker buildx bake -f bake.hcl --dry-run \
+          docker buildx bake -f bake.hcl --print \
             --set "*.platform=linux/amd64" \
-            --set "target.${{ matrix.target }}.tags=test:latest"
+            --set "${{ matrix.target }}.tags=test:latest"
 
       - name: Check Dockerfile syntax — base
         if: matrix.target == 'pytorch-base'

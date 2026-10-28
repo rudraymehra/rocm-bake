@@ -22,7 +22,11 @@
 
 set -uo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+
+# Record this run so `make build-stop` can find it without matching
+# command lines, which is unreliable — see .builders/build-stop.sh.
+echo $$ >> "${BUILD_PIDFILE:-/tmp/.rocm-build.pids}"
 
 DRY_RUN=0
 BEST_ONLY=0
@@ -43,9 +47,27 @@ MIN_MEM_GB="${MIN_MEM_GB:-8}"
 # Stages run in order; targets within a stage run concurrently on
 # different nodes. The dependencies are real: pytorch needs base, and
 # aiter needs both pytorch and the triton wheels.
-STAGE_1="pytorch-base"
-STAGE_2="pytorch triton-wheel"
-STAGE_3="pytorch-run pytorch-wheel aiter-wheel"
+# Order within a stage is priority, not preference: targets are handed
+# to nodes best-first, so the most expensive target must be listed
+# first or it gets whatever is left. That was backwards for stage 3 —
+# aiter-wheel was last, so the 50-minute kernel compile landed on the
+# weakest node at MAX_JOBS=12 while two targets costing 67s and 32s
+# took snoc-think's 32 jobs.
+# Overridable so a run can skip a target without editing this file —
+# e.g. STAGE_3="pytorch-wheel" to build a new arch without AITER, which
+# costs more than everything else combined.
+STAGE_1="${STAGE_1:-pytorch-base}"
+# triton-wheel before pytorch, not beside it: the pytorch image now
+# installs our triton wheel, so it needs that target's result. They
+# used to run concurrently on two nodes; this costs triton's duration
+# on the critical path (~90s once its cache is warm, since the build is
+# architecture-independent and hits 100%).
+STAGE_2="${STAGE_2:-triton-wheel}"
+STAGE_2B="${STAGE_2B:-pytorch}"
+# pytorch-run omitted: no node has a working GPU, so the runtime image
+# cannot be exercised and is not worth a slot. Add it back here when
+# one does.
+STAGE_3="${STAGE_3:-aiter-wheel pytorch-wheel}"
 
 # ── node capacity ────────────────────────────────────────────────
 # score = free GB of RAM + idle cores. Memory is weighted equally with
@@ -180,7 +202,7 @@ if [ "$BEST_ONLY" = 1 ]; then
     exit 0
 fi
 
-for stage in "$STAGE_1" "$STAGE_2" "$STAGE_3"; do
+for stage in "$STAGE_1" "$STAGE_2" "$STAGE_2B" "$STAGE_3"; do
     run_stage "$stage" || { echo "balance: stage failed: $stage" >&2; exit 1; }
 done
 

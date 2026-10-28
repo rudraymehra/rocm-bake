@@ -56,7 +56,18 @@ COPY --from=pytorch /opt/venv/lib/python${PYTHON_VERSION}/site-packages/ \
 ENV ROCM_PATH=/opt/rocm
 ENV PATH=${ROCM_PATH}/bin:${ROCM_PATH}/hip/bin:${PATH}
 ENV LD_LIBRARY_PATH=${ROCM_PATH}/lib:/opt/rocm/lib
-ENV HSA_OVERRIDE_GFX_VERSION=11.0.2
+# No HSA_OVERRIDE_GFX_VERSION. It used to be pinned to 11.0.2 here,
+# which tells HSA to treat whatever GPU it finds as gfx1102 (RDNA3).
+# That is a workaround for running on a GPU with no native support, and
+# it is actively harmful everywhere else: on a real gfx1201 it made HSA
+# fail at init with "HSA_STATUS_ERROR_OUT_OF_RESOURCES" and
+# hipGetDeviceCount returning hipErrorNoDevice, so torch saw no device
+# at all. Removing it, the same image reports
+# "AMD Radeon RX 9070 XT gfx1201" and runs a correct matmul.
+#
+# If a specific host ever needs the override, set it per-run
+# (docker run -e HSA_OVERRIDE_GFX_VERSION=...) rather than baking it
+# into every image.
 
 # Verify the import only. torch.cuda.is_available() is false inside a
 # buildkit RUN — there is no /dev/kfd — so asserting on it here could
