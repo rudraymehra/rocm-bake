@@ -3,9 +3,16 @@
 # Built first to maximize cache reuse across PyTorch rebuilds
 
 ARG ROCM_VERSION=10.1.0-full
-ARG PYTHON_VERSION=3.12
+ARG PYTHON_VERSION=3.14
 
-FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION} AS base
+FROM rocm/dev-ubuntu-26.04:${ROCM_VERSION} AS base
+
+# Re-declare inside the stage. ARGs before the first FROM live in the
+# global scope only, so without these every ${PYTHON_VERSION} below
+# expands to the empty string — `apt-get install python` rather than
+# python3.14, which fails with "no installation candidate".
+ARG ROCM_VERSION
+ARG PYTHON_VERSION
 
 LABEL org.opencontainers.image.source="https://github.com/your-org/rocm-pytorch-build"
 LABEL org.opencontainers.image.description="ROCm ${ROCM_VERSION} development base with Python ${PYTHON_VERSION}"
@@ -27,13 +34,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     wget \
     build-essential \
+    pkg-config \
+    liblzma-dev \
+    libzstd-dev \
+    zlib1g-dev \
     libsndfile1-dev \
     libgl1-mesa-dev \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up Python environment
-ARG PYTHON_VERSION
 RUN python${PYTHON_VERSION} -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel
 
@@ -53,8 +63,19 @@ RUN pip install --no-cache-dir \
 # ROCm environment
 ENV ROCM_PATH=/opt/rocm
 ENV PATH=${ROCM_PATH}/bin:${ROCM_PATH}/hip/bin:${PATH}
-ENV LD_LIBRARY_PATH=${ROCM_PATH}/lib:/opt/rocm/lib:$LD_LIBRARY_PATH
-ENV HSA_OVERRIDE_GFX_VERSION=11.0.2
+ENV LD_LIBRARY_PATH=${ROCM_PATH}/lib:/opt/rocm/lib
+# No HSA_OVERRIDE_GFX_VERSION. It used to be pinned to 11.0.2 here,
+# which tells HSA to treat whatever GPU it finds as gfx1102 (RDNA3).
+# That is a workaround for running on a GPU with no native support, and
+# it is actively harmful everywhere else: on a real gfx1201 it made HSA
+# fail at init with "HSA_STATUS_ERROR_OUT_OF_RESOURCES" and
+# hipGetDeviceCount returning hipErrorNoDevice, so torch saw no device
+# at all. Removing it, the same image reports
+# "AMD Radeon RX 9070 XT gfx1201" and runs a correct matmul.
+#
+# If a specific host ever needs the override, set it per-run
+# (docker run -e HSA_OVERRIDE_GFX_VERSION=...) rather than baking it
+# into every image.
 
 # Verify ROCm installation
 RUN rocm-smi --showversion 2>/dev/null || true \

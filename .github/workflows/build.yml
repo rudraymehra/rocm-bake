@@ -17,7 +17,7 @@ on:
         required: false
       registry:
         description: 'Registry URL'
-        default: 'localhost:5000'
+        default: 'snoc-strix.fold-leaffish.ts.net:8080'
         required: false
       push:
         description: 'Push to registry'

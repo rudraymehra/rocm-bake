@@ -33,38 +33,36 @@ jobs:
 
       - name: Validate bake.hcl target syntax
         run: |
-          docker buildx bake -f bake.hcl --dry-run \
+          docker buildx bake -f bake.hcl --print \
             --set "*.platform=linux/amd64" \
-            --set "target.${{ matrix.target }}.tags=test:latest"
+            --set "${{ matrix.target }}.tags=test:latest"
 
-      - name: Check Dockerfile syntax — base
-        if: matrix.target == 'pytorch-base'
-        run: docker build -f Dockerfile.base --progress=plain --target base .
-
-      - name: Check Dockerfile syntax — pytorch (no network deps)
-        if: matrix.target == 'pytorch'
-        run: |
-          docker build -f Dockerfile.pytorch \
-            --progress=plain \
-            --build-arg ROCM_VERSION=7.14 \
-            --build-arg PYTORCH_VERSION=2.14.1 \
-            --build-arg PYTORCH_ROCM_ARCH=gfx950 \
-            --build-arg PYTHON_VERSION=3.12 \
-            --target builder \
-            --network=host \
-            -t test-pytorch-builder .
-
-      - name: Check Dockerfile syntax — runtime
-        if: matrix.target == 'pytorch-run'
-        run: docker build -f Dockerfile.runtime --progress=plain --target final .
+      # The three `docker build` steps that used to sit here pulled the
+      # base image from the tailnet Zot
+      # (snoc-strix.fold-leaffish.ts.net:8080), which a GitHub-hosted
+      # runner cannot resolve:
+      #
+      #   failed to do request: Head "https://snoc-strix...:8080/v2/...":
+      #   dial tcp: lookup snoc-strix.fold-leaffish.ts.net: no such host
+      #
+      # They were not failing for a fixable reason, so they are gone
+      # rather than skipped. Dockerfile correctness is covered by
+      # hadolint in lint.yml, which needs no registry. Restore them
+      # behind `runs-on: [self-hosted]` if a fleet runner is ever
+      # registered — that is the only place they can work.
 
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: HCL lint — bake.hcl
-        uses: nicholarquinoh/hcledit-action@v1
-        with:
-          command: validate
-          path: bake.hcl
+        # Was nicholarquinoh/hcledit-action@v1, which GitHub cannot
+        # resolve ("repository not found") — so this job had never run.
+        # bake's own parser is the authority on whether bake.hcl is
+        # valid anyway, and --print exercises it without pulling or
+        # building anything.
+        run: docker buildx bake -f bake.hcl --print > /dev/null

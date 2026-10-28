@@ -1,12 +1,17 @@
 # Quick Start — ROCm PyTorch Build Lab
 
-Get a working build environment on SNOC Strix (primary) and SNOC Think (secondary) in under 15 minutes.
+Get a working build environment on SNOC Strix (primary), with
+snoc-thinkstation and snoc-gaming as extra build nodes, in under 15
+minutes.
 
 ## Prerequisites
 
-- Two machines on the same Tailscale network
-- Strix: AMD gfx950 GPU, 64 GB RAM, Docker 27+
-- Think: any ROCm-capable GPU, Docker 27+
+- All nodes on the same Tailscale network
+- Strix: AMD gfx950 GPU, 30 GB RAM, Docker 27+ — runs Zot, the shared
+  compiler cache, and the GPU tests
+- snoc-thinkstation, snoc-gaming: Docker 27+ and SSH from Strix. Both are
+  gfx1201 (RDNA4): they cross-compile for gfx950 but cannot run the test
+  stage
 
 Verify Docker is ready:
 
@@ -23,85 +28,214 @@ git clone <your-repo-url> rocm-pytorch-build
 cd rocm-pytorch-build
 ```
 
-## Step 2 — Deploy Zot (Strix only)
+## Step 2 — Check Zot (Strix only)
 
-Zot is the local OCI registry that caches Docker images.
-
-```bash
-cd zot
-docker compose up -d
-```
-
-Wait ~10 seconds, then verify:
+Zot is the local OCI registry that caches images and holds the BuildKit
+layer cache. It already runs on Strix as a bare-metal systemd service
+(`zot.service`, config in `/etc/zot/config.json`), deployed and owned
+outside this repo. **Do not start a second one** — this repo consumes the
+existing service and never manages its lifecycle.
 
 ```bash
-curl -s http://localhost:5000/v2/_catalog | python3 -m json.tool
+make zot-check
 ```
 
-Expected: `{}` (empty catalog is normal — no images pushed yet).
+Expected: `zot.service: active` and `Zot registry is ready at
+snoc-strix.fold-leaffish.ts.net:8080`. To see what it holds:
+
+```bash
+make zot-catalog
+```
+
+Anonymous read is open — every pull, pull-through and cache read works
+unauthenticated. Only pushing needs the `ci` account from
+`/etc/zot/htpasswd`.
+
+Store the credential with `pass`, which is GPG-encrypted at rest and
+works over SSH. The `secretservice` helper does not: it fails with
+`Cannot create an item in a locked collection` whenever the gnome-keyring
+login collection has not been unlocked by a graphical session.
+
+```bash
+sudo apt-get install -y pass golang-docker-credential-helpers
+pass init <your-gpg-key-id>          # gpg --list-secret-keys --keyid-format=long
+# set "credsStore": "pass" in ~/.docker/config.json
+docker login snoc-strix.fold-leaffish.ts.net:8080 -u ci
+```
+
+Verify it landed:
+
+```bash
+docker-credential-pass list
+```
+
+Zot also needs a raised HTTP read timeout, or pushing the ROCm base
+fails: its largest layer is 8.67GB and cannot cross a 1Gb/s link within
+Zot's 60-second default. In `/etc/zot/config.json`:
+
+```json
+"http": {
+  "readTimeout": "30m",
+  "writeTimeout": "30m"
+}
+```
+
+followed by `sudo systemctl restart zot`. Check with `make zot-check`.
+
+One login on Strix is enough for the whole fleet. buildx sends registry
+auth from your local Docker config to the builder as a session
+attachment, so builds pushing from think or gaming use it too — those
+nodes never need their own credential.
+
+The registry serves plain HTTP over the tailnet, so the Docker daemon
+needs it in `/etc/docker/daemon.json` (already set on Strix):
+
+```json
+{
+  "insecure-registries": ["snoc-strix.fold-leaffish.ts.net:8080"],
+  "registry-mirrors": ["http://snoc-strix.fold-leaffish.ts.net:8080"]
+}
+```
 
 ## Step 3 — Create the buildx builder (Strix)
 
 ```bash
-docker buildx create --name strix --driver docker-container
-docker buildx use strix
+make builder-snoc-strix
 ```
 
-(Optional) On Think, add a remote builder:
+The builder needs `.builders/buildkitd-strix.toml` — `make builder-snoc-strix`
+passes it. That config carries three things builds cannot work without:
+plain HTTP to Zot, the Zot pull-through mirrors, and a `[dns]` block so
+RUN steps can resolve tailnet names (they get their own resolv.conf, not
+the node's). Creating the builder by hand needs both flags: `--config`,
+and `network=host` so the builder itself resolves the registry.
+
+Both settings are baked in at create time. After editing the toml,
+`docker buildx rm snoc-strix && make builder-snoc-strix` — an existing builder
+does not pick up changes.
 
 ```bash
-docker buildx create --name think --driver remote tcp://snoc-think:1234
+docker buildx create --name snoc-strix --driver docker-container \
+  --driver-opt network=host \
+  --config .builders/buildkitd-strix.toml
+docker buildx use snoc-strix
 ```
 
-## Step 4 — Deploy sccache (both nodes)
-
-sccache speeds up repeated builds by caching compiled object files.
+(Optional) Add the other two nodes. They join over SSH to their Docker
+daemons, so nothing needs installing on them — no buildkitd, no TLS
+certs, not even the buildx plugin:
 
 ```bash
-sudo ./deploy-sccache.sh strix 0.7.7 200G
+make builder-snoc-think     # snoc-think (runs on snoc-thinkstation)
+make builder-snoc-gaming    # snoc-gaming
+make builder-snoc-pool      # all three as one builder named "snoc-pool"
+make builder-status    # docker buildx ls
 ```
 
-On Think (if applicable):
+Then target the whole fleet:
 
 ```bash
-sudo ./deploy-sccache.sh think 0.7.7 200G
+make build-all BUILDER=snoc-pool
 ```
 
-Verify:
+The pool fans *targets* out across nodes; it does not split one image
+across them. Both remote nodes are gfx1201 (RDNA4), so they can
+cross-compile for gfx950 but cannot run the GPU test stage — keep
+`make test` on Strix.
+
+## Step 4 — Deploy the shared compiler cache (Strix only)
+
+Every build node compiles against one shared sccache store, so an object
+compiled on any node is a cache hit on the others. The store is
+memcached on Strix: 8GB in RAM, then spilling to a 200GB file on disk.
 
 ```bash
-sccache --show-stats
+sudo ./.builders/deploy-memcached.sh
 ```
 
-You should see current stats (hits = 0 on first run).
+Verify it is up and reachable from the other nodes:
+
+```bash
+printf 'stats\r\nquit\r\n' | nc snoc-strix.fold-leaffish.ts.net 11211 \
+  | grep -E 'curr_items|get_hits|get_misses|extstore_pages_free'
+```
+
+There is nothing to install on thinkstation or gaming: each build
+container runs its own sccache client and server, pointed at this store.
+
+> `.builders/deploy-sccache.sh` installs a *node-level* sccache daemon on
+> port 4226. Builds do not use it — it is only for compiling on the host
+> directly. Leave it alone unless you need that; it must never move to
+> port 4250, which the in-container servers use.
 
 ## Step 5 — Build
 
-Build the full pipeline:
-
 ```bash
-docker buildx bake -f bake.hcl
+make build-all              # every target
+make build-pytorch          # just PyTorch (~30-60 min cold)
+make build-all BUILDER=snoc-pool # fan targets across all three nodes
 ```
 
-Or individual targets:
+To measure true build cost, `make cold-build` disables both caches —
+no layer reuse and no sccache hits, so every object really compiles:
 
 ```bash
-docker buildx bake -f bake.hcl pytorch-base   # ROCm base image only
-docker buildx bake -f bake.hcl pytorch          # PyTorch build (takes ~30-60 min)
-docker buildx bake -f bake.hcl pytorch-run      # Minimal runtime image
+make cold-build BUILDER=snoc-think
+make cold-build COLD_TARGET=pytorch-base
 ```
 
-Push to Zot:
+`--no-cache` on its own is not cold: sccache would still serve every
+object from the shared store and the build would finish in minutes
+while measuring nothing.
+
+Each `make build-*` runs through `telemetry/build.sh`, which records
+duration, layer-cache hit ratio and sccache counters, then exits with
+the build's own status. `TELEMETRY=0 make build-pytorch` skips it.
+
+The build refuses to start if the shared compiler cache is unreachable,
+rather than silently recompiling everything cold. To override:
 
 ```bash
-docker buildx bake -f bake.hcl --push
+docker buildx bake -f bake.hcl --set '*.args.REQUIRE_SCCACHE=0' pytorch
 ```
+
+Push to Zot (needs the `ci` login from Step 2):
+
+```bash
+make push-all
+```
+
+After a build, the metrics are in
+`/var/lib/node_exporter/textfile_collector/rocm_pytorch_build.prom`, or
+`telemetry/out/` when that directory is not writable.
+
+Watch a build from a second terminal — this covers every builder, with a
+live tail of each running build:
+
+```bash
+make watch
+make watch WATCH_BUILDERS=snoc-think WATCH_LINES=40
+```
+
+Or look at one thing at a time:
+
+```bash
+make build-status     # records on $(BUILDER): running, completed, errored
+make build-logs       # step output, BUILD=<id> for a specific record
+make build-inspect    # duration, steps, cached steps, VCS revision
+make builder-logs     # buildkitd's own log: registry, DNS, cache failures
+make builder-restart  # clear a wedged build on $(BUILDER)
+```
+
+`build-logs` is what the build's steps printed; `builder-logs` is the
+daemon underneath, which is where a registry or DNS fault shows up while
+the build itself merely looks slow.
 
 ## Step 6 — Verify the build
 
 ```bash
-docker run --rm -it --gpus all \
-  localhost:5000/rocm-pytorch/pytorch:2.14.1-10.1-gfx950
+docker run --rm -it --device /dev/kfd --device /dev/dri \
+  snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/pytorch:2.14.1-10.1.0-full-gfx950
 ```
 
 Then in the container:
@@ -134,14 +268,16 @@ docker buildx bake -f bake.hcl \
 
 ## Clean up
 
-Remove all built images:
-
 ```bash
-make clean-all
+make clean         # remove built images locally
+make clean-cache   # drop the registry cache images
 ```
 
 ## What next?
 
-- See `README.md` for full architecture, telemetry, and troubleshooting
+- [README.md](README.md) is the reference: architecture, how the three
+  caches fit together, every bake variable, and troubleshooting
 - `.github/workflows/` contains CI, build, and version-check workflows
-- `.builders/` has systemd service files for buildkitd and sccache
+- `.builders/` holds the node setup: buildkitd config, the memcached
+  store deployer, and the optional host-level sccache service
+- Zot is not managed here: `systemctl status zot`, `make zot-logs`

@@ -10,28 +10,28 @@ Automated build pipeline for PyTorch with ROCm support optimized for AMD Strix H
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                         SNOC Build Network                                │
 │                                                                          │
-│  ┌──────────────────────┐          ┌──────────────────────┐              │
-│  │   SNOC Strix         │          │   SNOC Think          │              │
-│  │   (Primary Build)    │          │   (Secondary Build)   │              │
-│  │                      │          │                       │              │
-│  │  AMD gfx950 GPU      │          │  GPU + Build Worker   │              │
-│  │  ~64GB RAM           │          │  ~16GB RAM            │              │
-│  │  BuildKitd           │          │  BuildKitd            │              │
-│  │  sccache server      │          │  sccache server       │              │
-│  │  Docker (container)  │          │  Docker               │              │
-│  │                      │          │                       │              │
-│  │  ROCm 7.1+           │          │  ROCm 7.1+            │              │
-│  └──────────┬───────────┘          └──────────┬───────────┘              │
-│             │                                  │                           │
-│             │       Tailscale Mesh (10.64.x.x) │                           │
-│             │──────────────────────────────────│                           │
-│             │                                  │                           │
-│             ▼                                  ▼                           │
+│  ┌──────────────────────┐   ┌──────────────────┐  ┌─────────────────┐    │
+│  │   SNOC Strix         │   │ snoc-thinkstation│  │  snoc-gaming    │    │
+│  │   (Primary Build)    │   │  (Build node)    │  │  (Build node)   │    │
+│  │                      │   │                  │  │                 │    │
+│  │  AMD gfx950 GPU      │   │  gfx1201 (RDNA4) │  │ gfx1201 (RDNA4) │    │
+│  │  ~64GB RAM           │   │  Docker 29+      │  │ Docker 29+      │    │
+│  │  buildx node (local) │   │  buildx via SSH  │  │ buildx via SSH  │    │
+│  │  sccache server      │   │  cross-compile   │  │ cross-compile   │    │
+│  │  zot.service         │   │  only, no test   │  │ only, no test   │    │
+│  │                      │   │                  │  │                 │    │
+│  │  snoc-strix          │   │ snoc-thinkstation│  │  snoc-gaming    │    │
+│  └──────────┬───────────┘   └────────┬─────────┘  └────────┬────────┘    │
+│             │                        │                     │              │
+│             │          Tailscale Mesh (100.x.y.z)          │              │
+│             │────────────────────────┴─────────────────────┘              │
+│             │                                                             │
+│             ▼                                                             │
 │  ┌──────────────────────────────────────────────────────────────┐         │
-│  │              Zot Registry (on Strix)                          │         │
-│  │              localhost:5000                                    │         │
+│  │         Zot Registry (bare metal on Strix, zot.service)       │         │
+│  │         snoc-strix.fold-leaffish.ts.net:8080                  │         │
 │  │                                                              │         │
-│  │  • Pull-through cache → Docker Hub, GHCR, NVCR               │         │
+│  │  • Pull-through sync → Docker Hub, GHCR, Quay                │         │
 │  │  • BuildKit layer cache as OCI artifacts                      │         │
 │  │  • PyTorch/ROCm image storage                                 │         │
 │  │  • sccache cache directory shared via bind mount              │         │
@@ -76,11 +76,11 @@ Automated build pipeline for PyTorch with ROCm support optimized for AMD Strix H
            ▼
      sccache ↔ sccache
      compiler   server
-     cache      (port 9000)
+     cache      (port 4226)
            │
            ▼
      Push to Zot
-     localhost:5000
+     snoc-strix.fold-leaffish.ts.net:8080
 ```
 
 ### Build Machine Roles
@@ -88,14 +88,22 @@ Automated build pipeline for PyTorch with ROCm support optimized for AMD Strix H
 **SNOC Strix (Primary)**
 - gfx950 GPU with full ROCm stack
 - 64GB shared memory (16GB reserved for host)
-- Runs Zot registry, sccache server, BuildKitd with containerd worker
+- Hosts the Zot registry (bare-metal `zot.service`, managed outside this
+  repo) and the sccache server
 - Primary build target — builds run here by default
+- The only node that can run the GPU test stage
 
-**SNOC Think (Secondary)**
-- Backup build node with ROCm support
-- Connects via Tailscale mesh network
-- Shares sccache cache directory for cross-node compiler caching
-- Can run distributed builds via remote BuildKitd endpoint
+**snoc-thinkstation / snoc-gaming (Build nodes)**
+
+- Joined to buildx over SSH to their Docker daemons: buildx creates and
+  owns a buildkit container on each, so neither needs buildkitd, TLS
+  certs, or the buildx plugin installed
+- Both gfx1201 (RDNA4) — they cross-compile for gfx950 fine, but cannot
+  run `make test`
+- Reach Zot over the tailnet at `snoc-strix.fold-leaffish.ts.net:8080`
+- `make builder-snoc-pool` groups all three into one builder named `pool`,
+  which fans build *targets* out across nodes (it does not split a single
+  image across them)
 
 ### Docker Image Lifecycle
 
@@ -104,7 +112,7 @@ Dockerfile.base          Dockerfile.pytorch        Dockerfile.runtime
         │                          │                        │
         ▼                          ▼                        ▼
   rocm/dev-ubu:7.14      ← pytorch 2.14.1 ← base image      ← pytorch wheel
-  + Python 3.12          + HIP/CUDA src   + sccache client  + runtime deps
+  + Python 3.14          + HIP/CUDA src   + sccache client  + runtime deps
   + dev tools            + ROCm tools      + env setup
   + NCCL/MKLDNN          + cmake + build   - build tools
   - ROCm headers         + sccache          only
@@ -112,10 +120,10 @@ Dockerfile.base          Dockerfile.pytorch        Dockerfile.runtime
 
 ## Components
 
-- **Zot Registry** - Lightweight OCI registry with pull-through caching for Docker Hub, GHCR, and NVCR
+- **Zot Registry** - Lightweight OCI registry with on-demand sync from Docker Hub, GHCR, and Quay. Runs bare-metal on Strix as `zot.service`; this repo consumes it and never starts, stops, or configures it
 - **Buildx Bake** - Declarative multi-stage build definitions with cache management
 - **Dockerfiles** - Three stages: base → build → runtime
-- **sccache** - Compiler cache server on port 9000 (200GB cache per node)
+- **sccache** - Compiler cache server on port 4226 (200GB cache per node)
 - **BuildKitd** - BuildKit daemon with ROCm GPU passthrough
 - **Telemetry** - Prometheus text collector for build metrics
 
@@ -128,110 +136,26 @@ Dockerfile.base          Dockerfile.pytorch        Dockerfile.runtime
 # Docker 27+ with containerd worker
 # Buildx with container driver
 # GPU: AMD gfx950 (Strix Halo)
-# RAM: 64GB+ shared (reserve 16GB for host)
+# RAM: 30GB shared with the GPU (reserve headroom for host + display)
 # Disk: 200GB+ for build cache
 ```
 
-### SNOC Think (Secondary Build Machine)
+### snoc-thinkstation / snoc-gaming (Build nodes)
 
 ```bash
-# BuildKitd exposed on port 1234
-# ROCm 7.14+
-# Network: snoc-think reachable via Tailscale (10.64.x.x)
+# Docker 27+ (no buildkitd, no TLS certs, no buildx plugin needed)
+# Reachable as `ssh snoc-thinkstation` / `ssh snoc-gaming` from Strix
+# Able to reach http://snoc-strix.fold-leaffish.ts.net:8080 over the tailnet
 # Disk: 200GB+ for build cache
 ```
 
 ## Quick Start
 
-### 1. Deploy Zot Registry
+The step-by-step runbook lives in [QUICKSTART.md](QUICKSTART.md): check
+Zot, create the builders, deploy the shared compiler cache, build, and
+verify. This file is the reference — architecture, how the caches fit
+together, every tunable, and troubleshooting.
 
-```bash
-cd zot
-docker compose up -d
-```
-
-Verify Zot is running:
-```bash
-curl -s http://localhost:5000/v2/_catalog
-```
-
-### 2. Configure Buildx Builders
-
-On **SNOC Strix**:
-```bash
-# Create docker-container driver builder
-docker buildx create --name strix --driver docker-container
-docker buildx use strix
-```
-
-On **SNOC Think** (optional, for distributed builds):
-```bash
-# Ensure buildkitd is running and exposed
-# Verify remote builder connectivity
-docker buildx create --name think --driver remote tcp://snoc-think:1234
-```
-
-### 3. Deploy sccache on Both Nodes
-
-```bash
-# Deploy to Strix
-sudo ./deploy-sccache.sh strix 0.7.7 200G
-
-# Deploy to Think
-sudo ./deploy-sccache.sh think 0.7.7 200G
-```
-
-Verify sccache is running:
-```bash
-sccache --show-stats
-```
-
-### 4. Build PyTorch
-
-Build all targets:
-```bash
-docker buildx bake -f bake.hcl
-```
-
-Push to Zot registry:
-```bash
-docker buildx bake -f bake.hcl --push
-```
-
-Build only PyTorch (not base/runtime):
-```bash
-docker buildx bake -f bake.hcl pytorch
-```
-
-Use Strix builder specifically:
-```bash
-docker buildx bake -f bake.hcl --builder strix pytorch
-```
-
-### 5. Run Telemetry Collector
-
-```bash
-# Collect current metrics
-./telemetry/collect.sh > /tmp/build_metrics.prom
-
-# Run periodically (every 5 minutes)
-./telemetry/collect.sh --interval 300 &
-```
-
-### 6. Test the Build
-
-```bash
-# Run the built image with GPU access
-docker run --rm -it --gpus all \
-  localhost:5000/rocm-pytorch/pytorch:2.14.1-7.14-gfx950
-```
-
-Expected output:
-```
-PyTorch 2.14.1+rocm7.14
-Devices: 1
-GPU: AMD ATI Radeon 780M/790M (gfx950)
-```
 
 ## Build Pipeline Details
 
@@ -251,10 +175,13 @@ pytorch-run (depends on pytorch output)
 
 ### Cache Strategy
 
-1. **BuildKit Layer Cache** → Stored in Zot as OCI artifacts
-2. **sccache Compiler Cache** → Per-node local storage (200GB)
-3. **Pull-Through Cache** → Zot caches Docker Hub/GHCR/NVCR images on demand
-4. **Multi-Builder** → Builds distribute across Strix and Think
+1. **BuildKit Layer Cache** → Stored in Zot as OCI artifacts, so a layer
+   built on one node is reusable from any of them
+2. **sccache Compiler Cache** → One shared store on Strix (memcached,
+   8GB RAM then spilling to a 200GB file on disk). An object compiled on
+   any node is a hit on the others
+3. **Pull-Through Cache** → Zot syncs Docker Hub/GHCR/Quay on demand
+4. **Multi-Builder** → Targets fan out across Strix, Thinkstation and Gaming
 
 ### Build Configuration
 
@@ -268,93 +195,136 @@ platform   = linux/amd64
 
 ### sccache Integration
 
-The build pipeline injects these environment variables into the Docker build container:
+Each build container runs its own sccache server, and all of them share
+one store: memcached on Strix, reached over the tailnet.
 
 ```
-SCCACHE_ADDR=localhost:9000
+SCCACHE_MEMCACHED=tcp://snoc-strix.fold-leaffish.ts.net:11211
+SCCACHE_SERVER_PORT=4250
 CMAKE_C_COMPILER_LAUNCHER=sccache
 CMAKE_CXX_COMPILER_LAUNCHER=sccache
 CMAKE_HIP_COMPILER_LAUNCHER=sccache
 ```
 
-sccache intercepts all compilation calls (gcc, g++, hcc, hipcc) and:
-- Caches compiled object files by content hash
-- Returns cached objects when source + flags match
-- Evicts oldest entries when cache exceeds 200GB
+sccache intercepts compiler invocations (gcc, g++, hipcc), caches object
+files by a hash of source plus flags, and returns the cached object when
+both match. Deploy the store with `.builders/deploy-memcached.sh`.
 
-Build completion automatically logs sccache stats to the build log.
+Three constraints make this work, and each one fails quietly if broken:
+
+- **A shared server is impossible.** sccache's client sends a *path*,
+  and the server reads and hashes the file itself. A server on the host
+  cannot see a build container's sources — every compile dies with
+  `No such file or directory`. Only the storage layer can be shared.
+- **Port 4250, not the default 4226.** Builders run with
+  `network=host`, so a client on the default port attaches to the node's
+  own `sccache.service` and hits the problem above (exit code 254).
+- **The store's hostname needs `[dns]` in the buildkitd config.** RUN
+  steps get a resolv.conf pointing at a public resolver, not the node's,
+  so a tailnet name is unresolvable from inside a build. The symptom is
+  `cache storage failed to read ... I/O error`, which reads like a dead
+  store rather than a DNS fault.
+
+`Dockerfile.pytorch` refuses to start a compile when the store is
+unreachable, rather than spending an hour rebuilding uncached. Override
+with `--set '*.args.REQUIRE_SCCACHE=0'`. The build prints
+`sccache --show-stats` as its last action, which is where the telemetry
+wrapper reads the counters from.
+
+## Watching a build
+
+Everything here is a make target; nothing needs raw docker commands.
+
+```bash
+make watch                            # live, all snoc-* builders at once
+make watch WATCH_BUILDERS=snoc-think  # narrow to one
+make watch WATCH_LINES=40 WATCH_INTERVAL=2
+```
+
+`make watch` shows the build record table for every builder, and under
+each running build a live tail of its steps. It is the usual way to
+follow a build from a second terminal while the first runs `make`.
+
+For a single look rather than a live view:
+
+| Target | Shows |
+| --- | --- |
+| `make build-status` | Build records on `$(BUILDER)`: running, completed, errored, with durations |
+| `make build-logs` | The step output of a build — `BUILD=<id>`, default most recent |
+| `make build-inspect` | Duration, step count, cached steps, VCS revision |
+| `make builder-logs` | buildkitd's *own* log for each node: registry auth, cache GC, connection failures |
+| `make builder-status` | All builders and their nodes |
+| `make builder-restart` | Restart buildkitd on `$(BUILDER)`, clearing a wedged build |
+| `make cold-build` | Build with no layer cache and no compiler-cache hits |
+
+Two different logs are easy to confuse. `build-logs` is the output of
+the build's steps — what a `RUN` printed. `builder-logs` is the daemon
+underneath: it is where a registry failure, a DNS failure or a cache
+problem shows up, often while the build itself just looks slow.
+
+`make builder-restart` drops that node's in-memory build state. The
+registry layer cache and the shared compiler cache are untouched, so the
+next build still picks up where it can.
 
 ## Telemetry & Metrics
 
-### Architecture
+Every build records its own telemetry. `telemetry/build.sh` wraps a bake
+invocation, runs it, then writes Prometheus metrics for each target it
+produced — and exits with the bake's own status, so it is a drop-in
+replacement for a bare `bake` call. The `make build-*` targets already
+route through it; set `TELEMETRY=0` for a bare bake.
 
-The telemetry system collects three categories of metrics:
-
-1. **Build Timing** - Wall-clock and per-step duration for each bake target
-2. **sccache Stats** - Hit/miss ratios, cache size, hit rate percentage
-3. **BuildKit Metrics** - Layer cache statistics from buildkitd (port 9999)
-
-All metrics are written in Prometheus text exposition format:
-
-```
-# HELP build_duration_seconds Total build time for each target
-# TYPE build_duration_seconds gauge
-build_duration_seconds{target="pytorch"} 3642.5
-
-# HELP sccache_stats Cache statistics
-# TYPE sccache_stats gauge
-sccache_stats{metric="hits"} 1247
-sccache_stats{metric="misses"} 83
-sccache_stats{metric="cache_size_bytes"} 1.2e11
-```
-
-### Telemetry Collection
-
-The `telemetry/collect.sh` script collects metrics from:
-
-- **sccache server** via `sccache --show-stats`
-- **buildkitd** via HTTP on port 9999 (configured in buildkitd.toml)
-- **Docker/Buildx** build logs for timing data
-- **rocm-smi** for GPU utilization during build
-
-Deploy on any node:
 ```bash
-./telemetry/collect.sh > /tmp/build_metrics.prom
+./telemetry/build.sh --builder snoc-pool pytorch
+make build-pytorch                  # same thing, via the Makefile
 ```
 
-Run as a service (optional):
+Both data sources already exist, so nothing has to be instrumented and
+no collector daemon runs:
+
+- **BuildKit's history API** (`docker buildx history inspect`) records
+  every build's duration and how many steps came from the layer cache.
+- **sccache's own stats**, printed at the end of the build step and
+  scraped back out of the build log. They cannot be queried afterwards:
+  the sccache server lives and dies with the build container.
+
+### Metrics
+
+| Metric | Meaning |
+| --- | --- |
+| `rocm_build_duration_seconds` | BuildKit-reported duration, per target |
+| `rocm_build_steps_total` / `_cached` | Build steps, and how many were cached |
+| `rocm_build_layer_cache_hit_ratio` | Cached steps over total steps |
+| `rocm_build_target_success` | 1 if the target completed |
+| `rocm_build_sccache_hits` / `_misses` | Compiler-cache counters for that build |
+| `rocm_build_sccache_hit_ratio` | Hits over hits+misses |
+| `rocm_build_invocation_duration_seconds` | Wall-clock for the whole bake |
+| `rocm_build_invocation_success` | 1 if the bake exited 0 |
+| `rocm_build_last_run_timestamp_seconds` | When the invocation finished |
+
+All carry a `builder` label; per-target metrics also carry `target`.
+
+### Prometheus integration
+
+Metrics are written to node_exporter's textfile collector when it is
+writable, otherwise to `telemetry/out/` (gitignored):
+
+```
+/var/lib/node_exporter/textfile_collector/rocm_pytorch_build.prom
+```
+
+node_exporter is already running on `:9100` here, so a scrape of that
+target picks them up with no extra job. The file is written to a temp
+path and renamed, so the collector never reads a partial file. Writing
+to the collector directory needs permission on it — otherwise the
+wrapper falls back and says so.
+
+To inspect the shared compiler cache itself:
+
 ```bash
-sudo cp telemetry/collect.service /etc/systemd/system/
-sudo systemctl enable --now collect-telemetry
+printf 'stats\r\nquit\r\n' | nc snoc-strix.fold-leaffish.ts.net 11211 \
+  | grep -E 'get_hits|get_misses|bytes|extstore_pages_used|evictions'
 ```
-
-### Prometheus Integration
-
-Add a scrape job to your Prometheus config:
-
-```yaml
-scrape_configs:
-  - job_name: 'build-telemetry'
-    static_configs:
-      - targets: ['strix:9100', 'think:9100']
-    metrics_path: '/metrics'
-    scheme: 'http'
-```
-
-Or use the textfile collector:
-```bash
-./telemetry/collect.sh > /etc/prometheus/textfile_build_metrics.prom
-```
-
-### Dashboard Metrics
-
-Key metrics for dashboards:
-- `build_duration_seconds` — Build time by target
-- `sccache_stats{metric="cache_hit_rate"}` — Compiler cache efficiency
-- `buildkit_cache_hit_ratio` — Docker layer cache efficiency
-- `gpu_memory_used_bytes` — Peak GPU memory during build
-- `build_total_success` — Count of successful builds (up/down counter)
-- `build_total_duration_seconds` — Build duration histogram
 
 ## Configuration
 
@@ -379,14 +349,33 @@ docker buildx bake -f bake.hcl \
 # Build from specific git ref
 docker buildx bake -f bake.hcl \
   --set "*.args.GIT_REF=refs/heads/develop" pytorch
+
+# Point at a different compiler-cache store
+docker buildx bake -f bake.hcl \
+  --set "*.args.SCCACHE_MEMCACHED=tcp://other-host:11211" pytorch
+
+# Build even though the compiler cache is unreachable
+docker buildx bake -f bake.hcl \
+  --set "*.args.REQUIRE_SCCACHE=0" pytorch
 ```
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `REGISTRY` | `snoc-strix.fold-leaffish.ts.net:8080` | Zot registry |
+| `SCCACHE_MEMCACHED` | `tcp://snoc-strix…:11211` | Shared compiler-cache store |
+| `SCCACHE_SERVER_PORT` | `4250` | In-container sccache port; must not be 4226 |
+| `REQUIRE_SCCACHE` | `1` | Fail the build if the store is unreachable |
+| `PYTORCH_ROCM_ARCH` | `gfx950` | Semicolon-separated GPU arch list |
+
+`TELEMETRY=0 make build-pytorch` skips the telemetry wrapper.
 
 ### Cache Configuration
 
 Cache is stored in Zot at:
-- `localhost:5000/rocm-pytorch/base-cache` - Base image cache
-- `localhost:5000/rocm-pytorch/pytorch-cache` - PyTorch build cache
-- `localhost:5000/rocm-pytorch/runtime-cache` - Runtime cache
+
+- `snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/base-cache` - Base image cache
+- `snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/pytorch-cache` - PyTorch build cache
+- `snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/runtime-cache` - Runtime cache
 
 To use cache from another build:
 ```bash
@@ -398,12 +387,11 @@ docker buildx bake -f bake.hcl \
 
 | Target | Description | Tags |
 |--------|-------------|------|
-|| `pytorch-base` | ROCm dev base with Python/toolchain | `rocm-pytorch/base:7.14-3.12` |
-|| `pytorch` | Full PyTorch build with deps | `rocm-pytorch/pytorch:2.14.1-7.14-gfx950` |
-|| `pytorch-run` | Minimal runtime image | `rocm-pytorch/runtime:2.14.1-7.14` |
-|| `pytorch-test` | Build + verify test | `rocm-pytorch/pytorch:2.14.1-7.14-gfx950-test` |
-| `default` | All targets | - |
-| `multi-build` | Multi-builder group | - |
+| `pytorch-base` | ROCm dev base with Python/toolchain | `rocm-pytorch/base:10.1.0-full-3.14` |
+| `pytorch` | Full PyTorch build with deps | `rocm-pytorch/pytorch:2.14.1-10.1.0-full-gfx950` |
+| `pytorch-run` | Minimal runtime image | `rocm-pytorch/runtime:2.14.1-10.1.0-full` |
+| `pytorch-test` | Build + verify test | `rocm-pytorch/pytorch:…-gfx950-test` |
+| `default` / `all` | Every target | - |
 
 ## Architecture Optimization
 
@@ -424,7 +412,7 @@ HIP_ARCHITECTURES="gfx900;gfx940;gfx941;gfx942;gfx950;gfx1100;gfx1101;gfx1102"
 1. **Layer caching** - Base image built first, cached in Zot
 2. **Incremental builds** - Changes to PyTorch source only rebuild affected layers
 3. **Registry cache** - Cache stored in Zot, accessible from any builder
-4. **Multi-builder** - Distribute builds across Strix and Think
+4. **Multi-builder** - Fan targets out across Strix, Thinkstation and Gaming
 5. **Compression** - Output compressed with zstd for smaller image size
 6. **sccache** - Compiler-level caching skips redundant HIP/CUDA compilation
 7. **Telemetry** - Real-time metrics for monitoring build health and cache efficiency
@@ -444,15 +432,60 @@ ls -la /dev/kfd /dev/dri
 ### Zot connection refused
 
 ```bash
-# Check Zot container status
-docker ps | grep zot
+# Check the Zot service (bare metal, not a container)
+systemctl status zot
 
 # Check Zot logs
-docker logs zot-registry
+sudo journalctl -u zot -n 50
 
 # Verify registry API
-curl -s http://localhost:5000/v2/_catalog
+curl -s http://snoc-strix.fold-leaffish.ts.net:8080/v2/_catalog
 ```
+
+Two different failures look similar from a build log:
+
+- `no such host` — the builder cannot resolve the tailnet name. It was
+  created without `--driver-opt network=host`, so Docker gave it the
+  upstream resolver instead of the host's MagicDNS one.
+- `http: server gave HTTP response to HTTPS client` — DNS is fine but the
+  client will not speak plain HTTP. For the Docker daemon, check
+  `insecure-registries` in `/etc/docker/daemon.json`; for BuildKit,
+  confirm the builder was created with
+  `--config .builders/buildkitd-strix.toml`.
+
+### Push dies at exactly 60 seconds
+
+Zot's default HTTP read timeout is 60s, measured across the whole request
+body. The ROCm base image has a single 8.67GB layer, which cannot cross a
+1Gb/s link in under ~73s, so every push of it failed at the 60s mark:
+Zot discarded the partial upload and returned 500, and buildkit retried
+with backoff. The client-side error is a connection reset, which reads
+like a network fault rather than a timeout — the giveaway is Zot's own
+log:
+
+```
+PUT /v2/.../blobs/uploads/...  statusCode: 500  latency: "1m0s"
+error: "read tcp ...: i/o timeout"   Content-Length: 8672333352
+```
+
+`/etc/zot/config.json` needs:
+
+```json
+"http": {
+  "readTimeout": "30m",
+  "writeTimeout": "30m"
+}
+```
+
+then `sudo systemctl restart zot`. That layer then pushes in ~200s. Zot
+is deployed from outside this repo, so the setting belongs in whatever
+provisions it, or it reverts on the next deploy.
+
+Both settings are fixed at builder-create time, so the fix is always
+`docker buildx rm <name>` then `make builder-<builder>`; editing the toml
+does nothing to an existing builder. Inspect with
+`docker buildx inspect <name>`. If pushes get 401, `docker login
+snoc-strix.fold-leaffish.ts.net:8080 -u ci`.
 
 ### Buildx builder not available
 
@@ -460,9 +493,8 @@ curl -s http://localhost:5000/v2/_catalog
 # List builders
 docker buildx ls
 
-# Create builder if missing
-docker buildx create --name strix --driver docker-container
-docker buildx use strix
+# Create builder if missing (--config and network=host are both required)
+make builder-snoc-strix
 ```
 
 ### Insufficient disk space
@@ -477,27 +509,43 @@ docker system prune -a
 
 ### sccache not caching
 
-```bash
-# Check sccache server is running
-sccache --show-stats
+The build refuses to start when the store is unreachable, so a silent
+no-cache build should not happen. If it does:
 
-# If stats show errors, restart the server
-sccache --stop-server
-sccache --start-server --cache-size=200G
+```bash
+# Is the shared store up and reachable from this node?
+printf 'stats\r\nquit\r\n' | nc snoc-strix.fold-leaffish.ts.net 11211 \
+  | grep -E 'get_hits|get_misses|evictions|extstore_pages_used'
+
+# Is it filling? bytes_written climbing means objects are landing
+systemctl status memcached        # on Strix
 ```
+
+Three failure modes have distinct signatures:
+
+| Symptom in the build log | Cause |
+| --- | --- |
+| `No such file or directory` on a source path | The client reached a server outside the container — `SCCACHE_SERVER_PORT` collided with the node's own 4226 daemon |
+| `cache storage failed to read ... I/O error` | The store's hostname did not resolve; check `[dns]` in `.builders/buildkitd-strix.toml` |
+| `Cache write errors` climbing | The store is full — extstore exhausted, and evictions are disabled by design |
+
+Builder settings are fixed at create time, so after changing the
+buildkitd config: `docker buildx rm snoc-strix && make builder-snoc-strix`.
 
 ### Telemetry not collecting
 
 ```bash
-# Check sccache stats collection
-./telemetry/collect.sh --test
+# Run a build through the wrapper directly and watch what it records
+./telemetry/build.sh --builder snoc-strix pytorch
 
-# Check buildkitd metrics endpoint
-curl -s http://localhost:9999/debug/vars
-
-# Check log output
-tail -f /var/log/sccache/sccache.log
+# Is there any build history to read?
+docker buildx history ls --builder snoc-strix
 ```
+
+Metrics land in `telemetry/out/` instead of the node_exporter directory
+when that directory is not writable — the wrapper says so when it falls
+back. sccache counters are absent when a target was fully layer-cached:
+the build step never ran, so it printed no stats.
 
 ## License
 
