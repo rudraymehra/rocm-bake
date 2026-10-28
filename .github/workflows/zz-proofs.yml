@@ -1,0 +1,155 @@
+# Temporary proof runs for rudray/cache-fixes. Not part of any PR.
+name: proofs
+on: push
+env:
+  BEFORE: origin/feat/get-it-working
+jobs:
+  forced-recache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: sccache 0.19.0 honours SCCACHE_RECACHE
+        run: |
+          curl -fsSL -o s.tgz https://github.com/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-unknown-linux-musl.tar.gz
+          echo "aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd  s.tgz" | sha256sum -c
+          tar xzf s.tgz; S=$PWD/sccache-v0.19.0-x86_64-unknown-linux-musl/sccache
+          export SCCACHE_DIR=$(mktemp -d)
+          echo 'int f(void){return 1;}' > a.c
+          st() { $S --show-stats --stats-format=json | jq -c '{hits: ([.stats.cache_hits.counts[]?]|add // 0), misses: ([.stats.cache_misses.counts[]?]|add // 0), forced_recaches: .stats.forced_recaches}'; }
+          $S gcc -c a.c -o a.o; $S gcc -c a.c -o a.o
+          echo "RESULT two normal compiles: $(st)"
+          SCCACHE_RECACHE=1 $S gcc -c a.c -o a.o
+          echo "RESULT then one with SCCACHE_RECACHE=1: $(st)"
+      - name: FORCE_RECACHE handling in each Dockerfile, before and after
+        run: |
+          git fetch -q origin feat/get-it-working
+          block() { # print the FORCE_RECACHE if-block of a Dockerfile, continuation lines joined
+            python3 -c '
+          import sys
+          s = sys.stdin.read().replace("\\\n", " ")
+          i = s.find("if [ \"${FORCE_RECACHE}\"")
+          print(s[i:s.index("fi;", i) + 3] if i >= 0 else "")'
+          }
+          for ref in "$BEFORE" HEAD; do
+            for f in Dockerfile.pytorch Dockerfile.triton Dockerfile.aiter; do
+              b=$(git show "$ref:$f" | block)
+              if [ -z "$b" ]; then echo "RESULT [$ref] $f: no FORCE_RECACHE handling"; continue; fi
+              for v in true false; do
+                r=$(FORCE_RECACHE=$v bash -c "$b"' >/dev/null; echo "${SCCACHE_RECACHE-unset}"')
+                echo "RESULT [$ref] $f: FORCE_RECACHE=$v -> SCCACHE_RECACHE=$r"
+              done
+            done
+          done
+
+  builder-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: make builder-snoc-strix when the pool already exists
+        run: |
+          git fetch -q origin feat/get-it-working
+          docker buildx create --name snoc-pool --node snoc-strix --driver docker-container --platform linux/amd64 > /dev/null
+          echo "RESULT buildx ls --format {{.Name}}: $(docker buildx ls --format '{{.Name}}' | tr '\n' ' ')"
+          for ref in "$BEFORE" HEAD; do
+            git show "$ref:Makefile" > /tmp/Makefile.x
+            set +e; out=$(make -f /tmp/Makefile.x builder-snoc-strix 2>&1); rc=$?; set -e
+            echo "RESULT [$ref] exit=$rc: $(echo "$out" | tr '\n' ' ' | cut -c1-200)"
+            docker buildx rm snoc-strix > /dev/null 2>&1 || true
+          done
+
+  ipv4-endpoint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: SCCACHE_WEBDAV_ENDPOINT when the name has AAAA and A records
+        run: |
+          git fetch -q origin feat/get-it-working
+          h=snoc-strix.fold-leaffish.ts.net
+          printf 'fd7a:115c:a1e0::5b01:3a25 %s\n100.91.58.37 %s\n' "$h" "$h" | sudo tee -a /etc/hosts > /dev/null
+          echo "RESULT getent hosts: $(getent hosts $h | head -1)"
+          echo "RESULT getent ahostsv4: $(getent ahostsv4 $h | head -1)"
+          for ref in "$BEFORE" HEAD; do
+            git show "$ref:Makefile" > /tmp/Makefile.x
+            echo "RESULT [$ref] $(make -s -f /tmp/Makefile.x list-vars | sed 's/\x1b\[[0-9;]*m//g' | grep SCCACHE_WEBDAV_ENDPOINT | tr -s ' ')"
+          done
+
+  cache-ref-overwrite:
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2
+        ports: ["5000:5000"]
+    steps:
+      - name: two targets exporting to one cache ref (pytorch / pytorch-wheel shape)
+        run: |
+          printf '[registry."localhost:5000"]\n  http = true\n  insecure = true\n' > bk.toml
+          docker buildx create --name ct --driver docker-container --driver-opt network=host --config bk.toml --bootstrap > /dev/null
+          mkdir w && cd w
+          printf 'FROM busybox AS builder\nRUN echo compile > /artifact\nFROM builder AS final\nRUN echo final-stage-install > /installed\nFROM scratch AS wheel\nCOPY --from=builder /artifact /\n' > Dockerfile
+          for variant in shared separate; do
+            ref=localhost:5000/cache-$variant
+            wheelcache=$ref; [ $variant = separate ] && wheelcache=$ref-wheel
+            cat > bake.hcl <<HCL
+          target "img" {
+            target     = "final"
+            cache-from = ["type=registry,ref=$ref:latest"]
+            cache-to   = ["type=registry,ref=$ref:latest,mode=max"]
+            output     = ["type=cacheonly"]
+          }
+          target "img-wheel" {
+            inherits   = ["img"]
+            target     = "wheel"
+            cache-from = ["type=registry,ref=$wheelcache:latest", "type=registry,ref=$ref:latest"]
+            cache-to   = ["type=registry,ref=$wheelcache:latest,mode=max"]
+          }
+          HCL
+            docker buildx bake --builder ct img > /dev/null 2>&1
+            docker buildx bake --builder ct img-wheel > /dev/null 2>&1
+            docker buildx prune --builder ct -af > /dev/null
+            log=$(docker buildx bake --builder ct --progress plain img 2>&1)
+            id=$(echo "$log" | grep -m1 'RUN echo final-stage-install' | sed -E 's/^#([0-9]+) .*/\1/')
+            if echo "$log" | grep -q "^#$id CACHED"; then s="CACHED (from registry)"; else s="REBUILT"; fi
+            echo "RESULT [$variant cache ref] image rebuilt on an empty builder after the wheel export: final stage $s"
+          done
+
+  stale-base:
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:2
+        ports: ["5000:5000"]
+    steps:
+      - name: pytorch built in the same bake as pytorch-base (build-all shape)
+        run: |
+          printf '[registry."localhost:5000"]\n  http = true\n  insecure = true\n' > bk.toml
+          docker buildx create --name sb --driver docker-container --driver-opt network=host --config bk.toml --use --bootstrap > /dev/null
+          mkdir w && cd w
+          printf 'FROM busybox\nARG MARK\nRUN echo "$MARK" > /marker\n' > Dockerfile.base
+          printf 'ARG BASE_IMAGE=localhost:5000/base:latest\nFROM ${BASE_IMAGE}\nRUN echo "pytorch built on base: $(cat /marker)"\n' > Dockerfile.pytorch
+          for variant in registry-ref target-context; do
+            extra=""; [ $variant = target-context ] && extra='contexts = { rocm-base = "target:pytorch-base" }
+            args = { BASE_IMAGE = "rocm-base" }'
+            cat > bake.hcl <<HCL
+          variable "MARK" { default = "" }
+          group "default" { targets = ["pytorch-base", "pytorch"] }
+          target "pytorch-base" {
+            dockerfile = "Dockerfile.base"
+            args       = { MARK = MARK }
+            tags       = ["localhost:5000/base:latest"]
+            output     = ["type=registry"]
+          }
+          target "pytorch" {
+            inherits   = ["pytorch-base"]
+            dockerfile = "Dockerfile.pytorch"
+            tags       = ["localhost:5000/pytorch:latest"]
+            output     = ["type=cacheonly"]
+            $extra
+          }
+          HCL
+            MARK="base from an earlier run" docker buildx bake pytorch-base > /dev/null 2>&1
+            out=$(MARK="base from this run" docker buildx bake --no-cache --progress plain default 2>&1 | grep -o 'pytorch built on base: .*' | tail -1)
+            echo "RESULT [$variant] $out"
+          done
