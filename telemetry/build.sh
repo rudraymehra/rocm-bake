@@ -99,9 +99,69 @@ for ref in ${REFS}; do
     # fact. Dockerfile.pytorch prints `sccache --show-stats` as the last
     # thing the build step does.
     # buildx writes the replayed build log to stderr, not stdout.
+    #
+    # A record contains more than its own target's steps. pytorch pulls
+    # triton-wheel in as a named context, so both are solved together
+    # and both print a stats block into the pytorch record's log. A
+    # bare `tail -1` took whichever block sorted last by step number,
+    # which is triton's:
+    #
+    #   #27 262.2 Cache hits  5674   <- pytorch, the record's own target
+    #   #28  95.6 Cache hits   361   <- triton, built as its dependency
+    #
+    # So every pytorch build was reported with triton's figure. The
+    # vertex headers cannot disambiguate here — in a replayed record
+    # they are all a bare "[builder 10/11]", with no bake-target prefix.
+    #
+    # What does identify the step is the file each Dockerfile tees its
+    # stats to, which names the image. The step's RUN text is in its
+    # header, so finding the marker gives the step number, and the
+    # stats lines carrying that number are the ones to read.
+    #
+    # The legacy fallback matters for a few hours after the rename that
+    # made these filenames unique: triton and aiter both used to tee to
+    # /wheels-sccache-stats.txt, so records written before it aged out
+    # would match no marker and silently drop their sccache numbers
+    # from `make watch`. Those old records are genuinely ambiguous and
+    # cannot be attributed exactly, but a possibly-imprecise number
+    # beats a blank panel until they expire.
+    marker=""; legacy=""
+    case "${name}" in
+        */pytorch/*|*Dockerfile.pytorch*)      marker="/opt/pytorch/sccache-stats.txt" ;;
+        */triton-wheel/*|*Dockerfile.triton*)  marker="/wheels-triton-sccache-stats.txt"
+                                               legacy="/wheels-sccache-stats.txt" ;;
+        */aiter-wheel/*|*Dockerfile.aiter*)    marker="/wheels-aiter-sccache-stats.txt"
+                                               legacy="/wheels-sccache-stats.txt" ;;
+        *) marker="" ;;
+    esac
+
     logs=$(docker buildx history logs "${ref}" --builder "${BUILDER}" 2>&1)
-    hits=$(grep -aE 'Cache hits +[0-9]+' <<< "${logs}" | tail -1 | grep -oE '[0-9]+$')
-    misses=$(grep -aE 'Cache misses +[0-9]+' <<< "${logs}" | tail -1 | grep -oE '[0-9]+$')
+    if [ -n "${marker}" ]; then
+        read -r hits misses < <(
+            awk -v marker="${marker}" -v legacy="${legacy}" '
+                # Vertex header naming the stats file: this step is ours.
+                # "tee <marker>", not the bare path: the final stage
+                # COPYs the same file out, so its header mentions the
+                # path too and would otherwise overwrite the match with
+                # a step that prints no stats at all.
+                /^#[0-9]+ \[/ && index($0, "tee " marker) { ours = substr($1, 2) }
+                /^#[0-9]+ \[/ && legacy != "" && index($0, "tee " legacy) {
+                    if (ours == "") ours = substr($1, 2)
+                }
+                # Only the plain counters: "#27 262.2 Cache hits 5674"
+                # is five fields with a number last. The variants
+                # ("Cache hits (C/C++) 3658", "Cache hits rate 89.71 %")
+                # have more, and the rate line ends in "%", which is
+                # what a bare $NF picked up.
+                ours != "" && $1 == "#" ours && NF == 5 && $5 ~ /^[0-9]+$/ {
+                    if ($3 == "Cache" && $4 == "hits")   h = $5
+                    if ($3 == "Cache" && $4 == "misses") m = $5
+                }
+                END { print h, m }' <<< "${logs}")
+    else
+        hits=$(grep -aE 'Cache hits +[0-9]+' <<< "${logs}" | tail -1 | grep -oE '[0-9]+$')
+        misses=$(grep -aE 'Cache misses +[0-9]+' <<< "${logs}" | tail -1 | grep -oE '[0-9]+$')
+    fi
 
     if [ -n "${hits:-}" ] && [ -n "${misses:-}" ]; then
         tot=$((hits + misses))

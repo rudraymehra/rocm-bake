@@ -1,0 +1,8 @@
+[codespell]
+# Only tracked sources; build output and vendored logs are noise.
+skip = .git,*.lock,dist,telemetry/out,*.prom,*.log,.claude
+# Domain vocabulary codespell mistakes for typos:
+#   hsa         ROCm's Heterogeneous System Architecture (HSA_OVERRIDE_GFX_VERSION)
+#   copys       prose about the Dockerfile COPY instruction
+#   re-declare  the ARG-after-FROM rule these Dockerfiles keep tripping over
+ignore-words-list = hsa,copys,re-declare,re-declared
