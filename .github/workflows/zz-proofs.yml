@@ -36,7 +36,7 @@ jobs:
               b=$(git show "$ref:$f" | block)
               if [ -z "$b" ]; then echo "RESULT [$ref] $f: no FORCE_RECACHE handling"; continue; fi
               for v in true false; do
-                r=$(FORCE_RECACHE=$v bash -c "$b"' >/dev/null; echo "${SCCACHE_RECACHE-unset}"')
+                r=$(FORCE_RECACHE=$v bash -c "{ $b } > /dev/null; echo \"\${SCCACHE_RECACHE-unset}\"")
                 echo "RESULT [$ref] $f: FORCE_RECACHE=$v -> SCCACHE_RECACHE=$r"
               done
             done
@@ -106,8 +106,9 @@ jobs:
             cache-to   = ["type=registry,ref=$wheelcache:latest,mode=max"]
           }
           HCL
-            docker buildx bake --builder ct img > /dev/null 2>&1
-            docker buildx bake --builder ct img-wheel > /dev/null 2>&1
+            cat bake.hcl
+            docker buildx bake --builder ct img 2>&1 | tail -5
+            docker buildx bake --builder ct img-wheel 2>&1 | tail -5
             docker buildx prune --builder ct -af > /dev/null
             log=$(docker buildx bake --builder ct --progress plain img 2>&1)
             id=$(echo "$log" | grep -m1 'RUN echo final-stage-install' | sed -E 's/^#([0-9]+) .*/\1/')
@@ -149,7 +150,8 @@ jobs:
             $extra
           }
           HCL
-            MARK="base from an earlier run" docker buildx bake pytorch-base > /dev/null 2>&1
+            cat bake.hcl
+            MARK="base from an earlier run" docker buildx bake pytorch-base 2>&1 | tail -5
             out=$(MARK="base from this run" docker buildx bake --no-cache --progress plain default 2>&1 | grep -o 'pytorch built on base: .*' | tail -1)
             echo "RESULT [$variant] $out"
           done
