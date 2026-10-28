@@ -107,10 +107,10 @@ jobs:
           }
           HCL
             cat bake.hcl
-            docker buildx bake --builder ct img 2>&1 | tail -5
-            docker buildx bake --builder ct img-wheel 2>&1 | tail -5
+            docker buildx bake -f bake.hcl --builder ct img 2>&1 | tail -5
+            docker buildx bake -f bake.hcl --builder ct img-wheel 2>&1 | tail -5
             docker buildx prune --builder ct -af > /dev/null
-            log=$(docker buildx bake --builder ct --progress plain img 2>&1)
+            log=$(docker buildx bake -f bake.hcl --builder ct --progress plain img 2>&1)
             id=$(echo "$log" | grep -m1 'RUN echo final-stage-install' | sed -E 's/^#([0-9]+) .*/\1/')
             if echo "$log" | grep -q "^#$id CACHED"; then s="CACHED (from registry)"; else s="REBUILT"; fi
             echo "RESULT [$variant cache ref] image rebuilt on an empty builder after the wheel export: final stage $s"
@@ -151,7 +151,7 @@ jobs:
           }
           HCL
             cat bake.hcl
-            MARK="base from an earlier run" docker buildx bake pytorch-base 2>&1 | tail -5
-            out=$(MARK="base from this run" docker buildx bake --no-cache --progress plain default 2>&1 | grep -o 'pytorch built on base: .*' | tail -1)
+            MARK="base from an earlier run" docker buildx bake -f bake.hcl pytorch-base 2>&1 | tail -5
+            out=$(MARK="base from this run" docker buildx bake -f bake.hcl --no-cache --progress plain default 2>&1 | grep -o 'pytorch built on base: .*' | tail -1)
             echo "RESULT [$variant] $out"
           done
