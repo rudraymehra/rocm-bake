@@ -11,11 +11,8 @@ import json
 import os
 import re
 import subprocess
-import tempfile
-import time
 import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 # A build step is a vertex buildkit labels "#7 [builder 2/9]"; a reused
 # one then reports "#7 CACHED". Both carry the same vertex number, which

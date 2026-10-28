@@ -30,7 +30,7 @@
 
 set -uo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 # /var/tmp, not /tmp: /tmp is a 16GB tmpfs here and a single base image
 # export already filled it once.
@@ -140,8 +140,8 @@ bench_run() {
     #
     # Polling until two consecutive reads agree keeps the derivation
     # (which is the thing being exercised) while removing the artefact.
-    local mem prev=0 settled=0 i
-    for i in $(seq 1 "${MEM_SETTLE_TRIES:-18}"); do
+    local mem prev=0 settled=0
+    for _ in $(seq 1 "${MEM_SETTLE_TRIES:-18}"); do
         mem=$(node_mem_avail_gb)
         [ -n "${mem}" ] || break
         if [ "${mem}" -ge "${MIN_MEM_GB:-8}" ] && \

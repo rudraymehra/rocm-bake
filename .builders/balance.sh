@@ -22,7 +22,7 @@
 
 set -uo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 # Record this run so `make build-stop` can find it without matching
 # command lines, which is unreliable — see .builders/build-stop.sh.

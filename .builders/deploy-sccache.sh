@@ -49,7 +49,6 @@ chmod 644 /var/log/sccache/sccache.log
 
 # Download sccache binary
 echo "⬇️  Downloading sccache v${VERSION}..."
-ARCH=$(dpkg --print-architecture)
 curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${VERSION}/sccache-v${VERSION}-x86_64-unknown-linux-musl.tar.gz" \
     -o "/tmp/sccache-${VERSION}.tar.gz"
 

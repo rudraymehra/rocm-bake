@@ -1,0 +1,12 @@
+extends: default
+
+rules:
+  # Workflow steps embed shell, and reflowing a long command to satisfy a
+  # linter is how working scripts get broken.
+  line-length: disable
+  # "on:" is a GitHub Actions key, not the boolean its name resembles.
+  truthy:
+    check-keys: false
+  document-start: disable
+  comments:
+    min-spaces-from-content: 1

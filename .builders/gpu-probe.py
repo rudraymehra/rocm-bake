@@ -153,7 +153,7 @@ try:
                 got = torch.nn.functional.scaled_dot_product_attention(q, q, q)
             err = (got.float() - base.float()).abs().max().item()
             check(f"sdpa {label}", err < 5e-2, f"max abs err {err:.2e}")
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             check(f"sdpa {label}", None, "unavailable on this arch")
 except Exception as exc:  # noqa: BLE001
     check("sdpa", False, repr(exc)[:70])
