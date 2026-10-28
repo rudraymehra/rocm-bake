@@ -378,6 +378,21 @@ target "pytorch-wheel" {
     "org.opencontainers.image.description" = "torch wheel for ${PYTORCH_ROCM_ARCH}, ROCm ${ROCM_VERSION}"
     "org.opencontainers.image.version"     = "${PYTORCH_VERSION}-${ROCM_VERSION}-${ARCH_TAG}"
   })
+
+  # Its own cache ref. Inherited from pytorch, both wrote pytorch-cache:latest,
+  # and a registry cache export replaces the manifest, so whichever ran last
+  # dropped the other's stages: balance.sh runs this target and aiter-wheel
+  # (which builds pytorch as a context) side by side in stage 3. It still
+  # reads pytorch's cache, which holds the shared compile stage.
+  cache-from = [
+    "type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/pytorch-wheel-cache:latest,mode=max,registry.insecure=true",
+    "type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/pytorch-wheel-cache:latest-ref,mode=max,registry.insecure=true",
+    "type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/pytorch-cache:latest,mode=max,registry.insecure=true",
+    "type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/pytorch-cache:latest-ref,mode=max,registry.insecure=true",
+    "type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/base-cache:latest,mode=max,registry.insecure=true",
+    "type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/base-cache:latest-ref,mode=max,registry.insecure=true",
+  ]
+  cache-to = ["type=registry,ref=${REGISTRY}/${REGISTRY_NAME}/pytorch-wheel-cache:latest${CACHE_TAG_SUFFIX},mode=max,image-manifest=true,oci-mediatypes=true,registry.insecure=true,ignore-error=true"]
 }
 
 # ─── Triton wheel ────────────────────────────────────────────────
