@@ -38,7 +38,12 @@
 [worker.oci]
   enabled = true
   platforms = ["linux/amd64"]
-  # 10 of the 16 cores, leaving headroom for the host and display
+  # Concurrent build STEPS, not cores. It caps how many vertices of the
+  # graph run at once; a single RUN step still uses as many threads as
+  # the command inside it wants. The PyTorch compile is one step, so this
+  # does not limit it at all — it saturated 32 cores on snoc-think with
+  # this set to 10. CPU is capped per builder with --driver-opt
+  # (cpuset-cpus / cpu-quota), and threads within a build with MAX_JOBS.
   max-parallelism = 10
   gc = true
   gckeepstorage = "100GB"

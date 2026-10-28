@@ -1,0 +1,163 @@
+# syntax=docker/dockerfile:1
+# AITER (github.com/ROCm/aiter) built as a standalone wheel.
+#
+# AITER is NOT built by PyTorch. The pytorch tree carries a
+# third_party/aiter submodule, but nothing in the PyTorch build reads
+# USE_AITER — it is a separate package with its own setup.py.
+#
+# It does need torch at build time: its setup.py imports torch, and its
+# own requirements note that "torch and triton are provided by the base
+# image as ROCm-specific builds ... not published on PyPI". So this
+# builds FROM our PyTorch image rather than from the ROCm base, which
+# means it runs after the pytorch target rather than alongside it. It is
+# still independent of the runtime image, so it can run on a different
+# node concurrently with other post-PyTorch work.
+#
+# The result is a thin image whose only payload is /wheels/*.whl. That
+# is how the wheel gets into Zot: an OCI image is something buildx can
+# push and `contexts` can consume, with no extra tooling (ORAS, a PyPI
+# index) and no second artifact store to keep alive.
+
+ARG PYTORCH_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/pytorch:latest
+ARG TRITON_WHEEL_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/triton-wheel:latest
+
+# Our ROCm 10.1 triton, as a wheelhouse for AITER's installer.
+FROM ${TRITON_WHEEL_IMAGE} AS tritonwheels
+
+FROM ${PYTORCH_IMAGE} AS builder
+
+ARG AITER_REF=main
+ARG PYTORCH_ROCM_ARCH=gfx950
+ARG SCCACHE_WEBDAV_ENDPOINT=http://snoc-strix.fold-leaffish.ts.net:8081
+# Namespace this project's objects. The store is shared with other
+# projects on the same fleet, and while sccache's keys are content
+# hashes (so sharing is normally safe and desirable), entries written
+# while two containers' sccache servers were crossed over a host port
+# were wrong — a triton build hit them and died with "stdlib.h: No such
+# file or directory" on a system that compiles that header fine. Proven
+# by rebuilding under an isolated prefix: zero such errors.
+#
+# The crossing itself is fixed by SCCACHE_SERVER_UDS above, so this
+# prefix is about abandoning the already-poisoned entries without
+# deleting a store other projects are still using, and about bounding
+# the blast radius if it ever recurs.
+ARG SCCACHE_WEBDAV_KEY_PREFIX=rocm-pytorch
+# A unix socket, not a TCP port. The builders run with
+# --driver-opt network=host, so SCCACHE_SERVER_PORT is shared by every
+# container on the node. A concurrent vLLM build on snoc-strix held
+# 4250, our triton client connected to *its* sccache server, and that
+# server could not see /opt/triton in its own mount namespace:
+#
+#   sccache: error: failed to spawn Command { cd "/opt/triton/build/..."
+#   sccache: caused by: No such file or directory (os error 2)
+#
+# Same root cause as the long-settled "one shared sccache server is
+# impossible" finding: the server compiles from its own filesystem. A
+# socket inside the container cannot be reached by another container,
+# so each build necessarily gets its own server.
+# 0 (upstream default) compiles nothing at package time — kernels are
+# JIT-built on first use, which is why this target finished in 49s and
+# barely touched sccache. 1 compiles the kernel modules for GPU_ARCHS at
+# build time, excluding the _tune modules and limiting MHA to the
+# fmha_v3 forward variants.
+#
+# GPU_ARCHS below is what makes this safe in a build container: without
+# it AITER falls back to "native" and shells out to rocminfo, which
+# finds no device and raises.
+ARG PREBUILD_KERNELS=1
+
+LABEL org.opencontainers.image.source="https://github.com/ROCm/aiter"
+LABEL org.opencontainers.image.description="AITER wheel for ${PYTORCH_ROCM_ARCH}"
+
+ENV PREBUILD_KERNELS=${PREBUILD_KERNELS} \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+    GPU_ARCHS=${PYTORCH_ROCM_ARCH} \
+    ROCM_PATH=/opt/rocm \
+    SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
+    SCCACHE_SERVER_UDS=/tmp/sccache.sock \
+    SCCACHE_WEBDAV_KEY_PREFIX=${SCCACHE_WEBDAV_KEY_PREFIX} \
+    SCCACHE_IGNORE_CLIENT_VERSION=1 \
+    SCCACHE_CONF=/etc/sccache.toml \
+    CMAKE_C_COMPILER_LAUNCHER=sccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=sccache \
+    CMAKE_HIP_COMPILER_LAUNCHER=sccache \
+    CMAKE_POLICY_VERSION_MINIMUM=3.5
+
+# sccache lives in Dockerfile.pytorch's *builder* stage and never
+# reaches `final`, which is what this image is FROM. Without it the
+# CMAKE_*_COMPILER_LAUNCHER settings above point at a missing binary and
+# the stats call at the end of the build step fails a build whose wheel
+# was produced successfully.
+ARG SCCACHE_VERSION=0.19.0
+RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    -o /tmp/sccache.tar.gz && \
+    tar xzf /tmp/sccache.tar.gz -C /usr/local/bin --strip-components=1 \
+        "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" && \
+    rm /tmp/sccache.tar.gz && chmod +x /usr/local/bin/sccache && sccache --version
+
+# Each RUN is a fresh container, so a build step has to start its own
+# sccache server, and startup probes the remote store. That probe is
+# bounded by a 10s timeout compiled into sccache — no environment
+# variable exists for it, only this config file field. Under load on the
+# node hosting the cache, 10s was not enough and the build died with
+# "Timed out waiting for server startup". The backend stays configured
+# by environment; this file carries only the timeout.
+RUN printf 'server_startup_timeout_ms = 60000\n' > /etc/sccache.toml
+
+# AITER's extensions are HIP, so the submodules under 3rdparty are not
+# optional any more than PyTorch's are.
+RUN git clone --depth 1 --branch ${AITER_REF} --recurse-submodules \
+    --shallow-submodules \
+    https://github.com/ROCm/aiter.git /opt/aiter
+
+WORKDIR /opt/aiter
+
+# AITER's setup.py runs .github/scripts/install_triton.sh, which
+# uninstalls whatever triton is present and installs one from AMD's
+# index. That index publishes nothing newer than ROCm 7.2, so against
+# our ROCm 10.1 torch it produces a three-major mismatch.
+#
+# The script checks TRITON_WHEEL_DIR first and only falls back to the
+# public index if that fails — but it needs BOTH triton and
+# triton-kernels present, hence Dockerfile.triton building both.
+COPY --from=tritonwheels /wheels/ /opt/triton-wheels/
+ENV TRITON_WHEEL_DIR=/opt/triton-wheels
+RUN ls -la /opt/triton-wheels/
+
+# --no-isolation means pip will NOT fetch the build backend's own
+# dependencies, so everything in [build-system].requires has to be
+# installed first. Read them out of pyproject.toml rather than hardcoding:
+# the list differs between AITER releases (v0.1.27 adds vcs_versioning on
+# top of main's setuptools_scm, pybind11, ninja, pandas, flydsl...).
+#
+# flydsl appears in that list, which is also the whole story on "FlyDSL":
+# it is a PyPI build dependency of AITER, not a PyTorch build option.
+RUN pip install --no-cache-dir build && \
+    python -c "import tomllib; print(chr(10).join(tomllib.load(open('pyproject.toml','rb'))['build-system']['requires']))" \
+        > /tmp/build-reqs.txt && \
+    echo "--- AITER build-system requires ---" && cat /tmp/build-reqs.txt && \
+    pip install --no-cache-dir -r /tmp/build-reqs.txt && \
+    pip install --no-cache-dir -r requirements.txt
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN python -m build --wheel --no-isolation \
+    --outdir /wheels \
+    2>&1 | tee /wheels-build.log \
+    && sccache --show-stats | tee /wheels-sccache-stats.txt
+
+SHELL ["/bin/sh", "-c"]
+
+RUN ls -la /wheels/
+
+# ─── Wheel-only image ────────────────────────────────────────────
+# scratch, not the PyTorch image: this exists to be consumed by
+# `COPY --from=`, so it should carry the wheel and nothing else.
+FROM scratch AS final
+
+ARG PYTORCH_ROCM_ARCH
+LABEL org.opencontainers.image.source="https://github.com/ROCm/aiter"
+LABEL org.opencontainers.image.description="AITER wheel for ${PYTORCH_ROCM_ARCH}"
+
+COPY --from=builder /wheels/ /wheels/
+COPY --from=builder /wheels-build.log /wheels-sccache-stats.txt /

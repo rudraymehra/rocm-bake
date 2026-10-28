@@ -3,14 +3,14 @@
 # Builds PyTorch with HIP support optimized for RDNA3/4 architecture
 # Requires PyTorch 2.14.0+ and ROCm 10.1+
 
-ARG BASE_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/base:10.1.0-full-3.12
+ARG BASE_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/base:10.1.0-full-3.14
 FROM ${BASE_IMAGE} AS builder
 
-LABEL org.opencontainers.image.source="https://github.com/your-org/rocm-pytorch-build"
-LABEL org.opencontainers.image.description="PyTorch ${PYTORCH_VERSION} ROCm ${ROCM_VERSION} gfx950 build"
-
 # ─── PyTorch source checkout ─────────────────────────────────────
-ARG PYTORCH_VERSION=2.14.0
+# These precede the LABELs below on purpose: an ARG referenced before it
+# is declared expands to the empty string, and the label silently loses
+# the version it is meant to record.
+ARG PYTORCH_VERSION=2.14.1
 ARG ROCM_VERSION=10.1.0-full
 ARG USE_AITER=ON
 ARG USE_FLYDSL=ON
@@ -19,20 +19,34 @@ ARG GIT_REF=""
 # Declared or the ENV references below expand to empty and the build
 # silently targets no GPU architecture at all.
 ARG PYTORCH_ROCM_ARCH=gfx950
-ARG PYTHON_VERSION=3.12
+ARG PYTHON_VERSION=3.14
 
-RUN git clone --depth 1 --branch v${PYTORCH_VERSION} \
+LABEL org.opencontainers.image.source="https://github.com/sbates130272/rocm-pytorch-build"
+LABEL org.opencontainers.image.description="PyTorch ${PYTORCH_VERSION} ROCm ${ROCM_VERSION} ${PYTORCH_ROCM_ARCH} build"
+
+# --recurse-submodules is not optional: PyTorch builds from third_party
+# submodules, and a plain clone produces empty directories and a cmake
+# failure a long way into the build.
+RUN git clone --depth 1 --branch v${PYTORCH_VERSION} --recurse-submodules \
+    --shallow-submodules \
     https://github.com/pytorch/pytorch.git /opt/pytorch \
     && cd /opt/pytorch \
     && if [ -n "${GIT_REF}" ]; then \
-       git fetch origin ${GIT_REF} && git checkout ${GIT_REF}; \
+       git fetch origin ${GIT_REF} && git checkout ${GIT_REF} \
+       && git submodule sync && git submodule update --init --recursive; \
     fi
 
 WORKDIR /opt/pytorch
 
 # ─── sccache compiler cache ──────────────────────────────────────
-# Install sccache binary (prebuilt from Mozilla releases)
-ARG SCCACHE_VERSION=0.7.7
+# Install sccache binary (prebuilt from Mozilla releases).
+#
+# The floor is 0.8.0, not a preference. Before it, gcc.rs had no "hip"
+# arm in its -x handling and fell through to cannot_cache!("-x"), so
+# every hipcc device compile was refused: a gfx950 build cached its C++
+# objects and recompiled every GPU kernel, which are the expensive ones.
+# Measured on 0.7.7: 990 of 1003 non-cacheable calls were "-x".
+ARG SCCACHE_VERSION=0.19.0
 RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
     -o /tmp/sccache.tar.gz && \
     mkdir -p /usr/local/bin && \
@@ -43,12 +57,12 @@ RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_
     sccache --version
 
 # sccache runs its own server inside this container, backed by the shared
-# memcached on Strix. Three things here are load-bearing:
+# WebDAV store on Strix. Three things here are load-bearing:
 #
-#  - memcached, not SCCACHE_DIR. A local directory is discarded with the
+#  - WebDAV, not SCCACHE_DIR. A local directory is discarded with the
 #    layer, which is how this silently cached nothing before. The store
 #    is shared, so an object compiled on one node is a hit on the others,
-#    and extstore spills past its RAM ceiling onto Strix's disk.
+#    and it is a directory tree on disk, so it survives a reboot.
 #  - A port no host process uses. The builder runs with network=host, so
 #    a client on 4226 would attach to the node's own sccache.service —
 #    and that server executes compiles in the *host* filesystem, where
@@ -58,26 +72,73 @@ RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_
 #    builder's resolver, so without that block this fails with "cache
 #    storage failed to read ... I/O error" and the build silently falls
 #    back to no caching at all.
-ARG SCCACHE_MEMCACHED=tcp://snoc-strix.fold-leaffish.ts.net:11211
-ARG SCCACHE_SERVER_PORT=4250
+ARG SCCACHE_WEBDAV_ENDPOINT=http://snoc-strix.fold-leaffish.ts.net:8081
+# Namespace this project's objects. The store is shared with other
+# projects on the same fleet, and while sccache's keys are content
+# hashes (so sharing is normally safe and desirable), entries written
+# while two containers' sccache servers were crossed over a host port
+# were wrong — a triton build hit them and died with "stdlib.h: No such
+# file or directory" on a system that compiles that header fine. Proven
+# by rebuilding under an isolated prefix: zero such errors.
+#
+# The crossing itself is fixed by SCCACHE_SERVER_UDS above, so this
+# prefix is about abandoning the already-poisoned entries without
+# deleting a store other projects are still using, and about bounding
+# the blast radius if it ever recurs.
+ARG SCCACHE_WEBDAV_KEY_PREFIX=rocm-pytorch
+# A unix socket, not a TCP port. The builders run with
+# --driver-opt network=host, so SCCACHE_SERVER_PORT is shared by every
+# container on the node. A concurrent vLLM build on snoc-strix held
+# 4250, our triton client connected to *its* sccache server, and that
+# server could not see /opt/triton in its own mount namespace:
+#
+#   sccache: error: failed to spawn Command { cd "/opt/triton/build/..."
+#   sccache: caused by: No such file or directory (os error 2)
+#
+# Same root cause as the long-settled "one shared sccache server is
+# impossible" finding: the server compiles from its own filesystem. A
+# socket inside the container cannot be reached by another container,
+# so each build necessarily gets its own server.
 # true forces every compile to run and repopulate: a genuinely cold build.
-ARG SCCACHE_RECACHE=false
-ENV SCCACHE_MEMCACHED=${SCCACHE_MEMCACHED} \
-    SCCACHE_SERVER_PORT=${SCCACHE_SERVER_PORT} \
+# Deliberately NOT named SCCACHE_RECACHE. A build ARG is injected into
+# every RUN step's environment, and sccache presence-tests that name, so
+# merely declaring the ARG forces recache mode regardless of its value.
+ARG FORCE_RECACHE=false
+# Empty means "derive from the node"; set it to pin a job count. Unset,
+# PyTorch's build uses every core, which OOMs a memory-light node the
+# same way triton did.
+ARG MAX_JOBS=
+ENV SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
+    SCCACHE_SERVER_UDS=/tmp/sccache.sock \
+    SCCACHE_WEBDAV_KEY_PREFIX=${SCCACHE_WEBDAV_KEY_PREFIX} \
     SCCACHE_IGNORE_CLIENT_VERSION=1 \
-    SCCACHE_RECACHE=${SCCACHE_RECACHE} \
+    SCCACHE_CONF=/etc/sccache.toml \
+    SCCACHE_ERROR_LOG=/tmp/sccache-err.log \
+    SCCACHE_LOG=warn \
     CMAKE_C_COMPILER_LAUNCHER=sccache \
     CMAKE_CXX_COMPILER_LAUNCHER=sccache \
     CMAKE_HIP_COMPILER_LAUNCHER=sccache
+
+# Each RUN is a fresh container, so the compile step has to start its
+# own sccache server, and startup probes the remote store. That probe is
+# bounded by a 10s timeout compiled into sccache — there is no
+# environment variable for it, only this config file field. 10s was not
+# enough while the node hosting the cache was saturated: the preflight
+# below passed, then the build died 21s in with "Timed out waiting for
+# server startup", failing cmake's compiler test and the whole build.
+#
+# The backend stays configured by environment; this file carries only
+# the timeout.
+RUN printf 'server_startup_timeout_ms = 60000\n' > /etc/sccache.toml
 
 # Fail early and loudly rather than spending an hour rebuilding PyTorch
 # against a cache that silently is not there.
 ARG REQUIRE_SCCACHE=1
 RUN if sccache --show-stats > /dev/null 2>&1; then \
-        echo "sccache: server up, cache = ${SCCACHE_MEMCACHED}"; \
+        echo "sccache: server up, cache = ${SCCACHE_WEBDAV_ENDPOINT}"; \
     elif [ "${REQUIRE_SCCACHE}" = "1" ]; then \
-        echo "ERROR: sccache could not reach ${SCCACHE_MEMCACHED}." >&2; \
-        echo "  Check memcached.service on Strix, and that this" >&2; \
+        echo "ERROR: sccache could not reach ${SCCACHE_WEBDAV_ENDPOINT}." >&2; \
+        echo "  Check nginx on Strix (sccache-webdav site), and that this" >&2; \
         echo "  builder was created with --driver-opt network=host." >&2; \
         echo "  Build anyway with --set '*.args.REQUIRE_SCCACHE=0'." >&2; \
         exit 1; \
@@ -94,28 +155,53 @@ ENV USE_AITER=${USE_AITER} \
     USE_FLYDSL=${USE_FLYDSL} \
     USE_FLASH_ATTENTION=${USE_FLASH_ATTENTION}
 
-ENV USE_ROCM=ON \
-    USE_CUDA=OFF \
-    CMAKE_CUDA_ARCHITECTURES="ROCM" \
+# CMAKE_CUDA_ARCHITECTURES="ROCM" and CMAKE_CXX_FLAGS="-march=gfx950"
+# are both gone. -march/-mtune are host-CPU flags: gfx950 is a GPU
+# target, so every host compile would have failed on an unrecognised
+# -march value. The GPU architecture is selected by PYTORCH_ROCM_ARCH
+# alone, which upstream documents as the supported mechanism.
+# PyTorch pulls cmake 4.x from pip, which dropped compatibility with
+# cmake_minimum_required(<3.5). Several vendored deps (confu/NNPACK and
+# friends) still declare it, and fail to configure without this.
+ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
+
+ENV USE_ROCM=1 \
+    USE_CUDA=0 \
     USE_MKLDNN=OFF \
     USE_NCCL=OFF \
     USE_KINETO=OFF \
     USE_FBGEMM=ON \
     USE_QNNPACK=ON \
-    USE_PYTHREAD=ON \
     BUILD_TEST=OFF \
     BUILD_BINARY=OFF \
     BUILD_SHARED_LIBS=ON \
-    CMAKE_BUILD_TYPE=Release \
-    CMAKE_CXX_FLAGS="-march=gfx950 -mtune=gfx950"
+    CMAKE_BUILD_TYPE=Release
 
 # ROCm specific build flags
 # HIP_ARCHITECTURES set via PYTORCH_ROCM_ARCH (default gfx950, override with semicolon-separated list)
 # Example: PYTORCH_ROCM_ARCH="gfx90a;gfx942;gfx1100"
-ENV ROCM_HOME=/opt/rocm \
-    HIP_ARCHITECTURES=${PYTORCH_ROCM_ARCH} \
+# ROCM_PATH is what the build system reads (ROCM_HOME is kept as the
+# older alias). PYTORCH_ROCM_ARCH is the documented way to pin the GPU
+# target; the build detects it automatically when unset.
+ENV ROCM_PATH=/opt/rocm \
+    ROCM_HOME=/opt/rocm \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
     USE_SYSTEM_NCCL=OFF \
-    CMAKE_HIP_FLAGS="-DGPU_ARCHS=${PYTORCH_ROCM_ARCH}"
+    CMAKE_PREFIX_PATH=/opt/venv
+
+# ─── Build requirements ──────────────────────────────────────────
+# Upstream's documented dependency install for 2.14 is the PEP 735 dev
+# group, not requirements.txt. --no-isolation means pip will not fetch
+# the build backend itself, so it has to be here too.
+RUN pip install --no-cache-dir build && \
+    pip install --no-cache-dir --group dev && \
+    pip install --no-cache-dir mkl-static mkl-include
+
+# ─── Hipify for ROCm ─────────────────────────────────────────────
+# Upstream: "If you're compiling for AMD ROCm then first run this
+# command". It rewrites CUDA sources to HIP in place; without it the
+# build compiles the CUDA paths and fails.
+RUN python tools/amd_build/build_amd.py
 
 # ─── Build PyTorch ───────────────────────────────────────────────
 # pipefail matters: without it the RUN takes tee's exit status, so a
@@ -123,10 +209,39 @@ ENV ROCM_HOME=/opt/rocm \
 # dist/ one step later.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN python setup.py bdist_wheel \
-    --dist-dir /opt/pytorch/dist \
+# PyTorch 2.14 dropped `setup.py bdist_wheel`: the build moved to
+# scikit-build-core behind the standard PEP 517 interface, and setup.py
+# now refuses every command except install/develop. --no-isolation keeps
+# the build in this environment so it sees ROCm, the pinned Python and
+# the sccache launchers; it means the build requirements have to be
+# present already, which the previous step installs.
+# SCCACHE_RECACHE must be set ONLY when a forced recache is wanted.
+# sccache checks presence, never value:
+#     let force_recache = env_vars.iter().any(|(k, _v)| k == "SCCACHE_RECACHE");
+# so SCCACHE_RECACHE=false enables it exactly as =true does. Exporting it
+# unconditionally put every build in write-only mode — sccache never read
+# the cache, so no build could ever hit.
+RUN if [ "${FORCE_RECACHE}" = "true" ] || [ "${FORCE_RECACHE}" = "1" ]; then \
+        export SCCACHE_RECACHE=1; \
+        echo "sccache: forced recache ON — cache reads disabled for this build"; \
+    else \
+        echo "sccache: normal mode — cache reads enabled"; \
+    fi; \
+    if [ -z "${MAX_JOBS}" ]; then \
+        cores=$(nproc); \
+        jobs=$(awk '/^MemAvailable:/ {print int($2/1024/1024/2)}' /proc/meminfo); \
+        [ -n "${jobs}" ] || jobs=${cores}; \
+        [ "${jobs}" -ge 1 ] || jobs=1; \
+        [ "${jobs}" -le "${cores}" ] || jobs=${cores}; \
+        export MAX_JOBS=${jobs}; \
+        echo "MAX_JOBS=${MAX_JOBS} (from ${cores} cores, $(awk '/^MemAvailable:/ {printf "%.0fGB", $2/1048576}' /proc/meminfo) available)"; \
+    else \
+        echo "MAX_JOBS=${MAX_JOBS} (pinned via build arg)"; \
+    fi; \
+    python -m build --wheel --no-isolation \
+    --outdir /opt/pytorch/dist \
     2>&1 | tee /opt/pytorch/build.log \
-    && sccache --show-stats | tee /opt/pytorch/sccache-stats.txt
+    && sccache --show-stats | tee /opt/pytorch/sccache-stats.txt; rc=$?; echo "--- sccache error log: $(wc -c < /tmp/sccache-err.log 2>/dev/null || echo absent) bytes ---"; grep -iE 'error|warn|write' /tmp/sccache-err.log 2>/dev/null | grep -v 'read failed NotFound' | head -40; exit $rc
 
 SHELL ["/bin/sh", "-c"]
 
@@ -154,27 +269,32 @@ else: \
 # ─── Final PyTorch image ─────────────────────────────────────────
 FROM ${BASE_IMAGE} AS final
 
-LABEL org.opencontainers.image.source="https://github.com/your-org/rocm-pytorch-build"
-LABEL org.opencontainers.image.description="Built PyTorch ${PYTORCH_VERSION} for gfx950"
+ARG PYTORCH_VERSION
+ARG ROCM_VERSION
+ARG PYTORCH_ROCM_ARCH
+
+LABEL org.opencontainers.image.source="https://github.com/sbates130272/rocm-pytorch-build"
+LABEL org.opencontainers.image.description="PyTorch ${PYTORCH_VERSION} for ${PYTORCH_ROCM_ARCH}, ROCm ${ROCM_VERSION}"
 
 # Build records, kept so timing and cache-hit data survive the build
 # stage being discarded. `make build-report` reads sccache-stats.txt.
 COPY --from=builder /opt/pytorch/build.log /opt/pytorch/sccache-stats.txt /var/log/pytorch-build/
 
-# Install the built wheel
-COPY --from=builder /opt/pytorch/dist/*.whl /opt/pytorch/dist/*.whl
+# Destination is a directory, not a glob. `COPY src/*.whl dest/*.whl`
+# treats the destination literally, so the wheel did not land where the
+# install step looked for it.
+COPY --from=builder /opt/pytorch/dist/ /opt/pytorch/dist/
 
-# Carry the build log and the compiler-cache stats into the shipped
-# image; in the builder stage they are unreachable once the build ends.
-COPY --from=builder /opt/pytorch/build.log /opt/pytorch/sccache-stats.txt /var/log/pytorch-build/
-
+# The torch install must be able to fail the build. Previously the
+# trailing `|| true` covered this whole chain, so when the glob did not
+# expand and pip errored with "Invalid wheel filename ... '*'", the
+# image was published without PyTorch in it.
 RUN pip install --no-cache-dir /opt/pytorch/dist/*.whl \
-    && rm -rf /opt/pytorch/dist/*.whl \
-    && pip install --no-cache-dir \
-        torchaudio \
-        torchdata \
-        torchvision \
-        2>&1 | tee /opt/pytorch/install.log || true
+    && python -c "import torch; print('installed torch', torch.__version__)"
+
+# The extras are genuinely optional, so they alone get the tolerance.
+RUN pip install --no-cache-dir torchaudio torchdata torchvision \
+    2>&1 | tee /var/log/pytorch-build/install.log || true
 
 # Clean build artifacts
 RUN rm -rf /opt/pytorch
@@ -189,3 +309,18 @@ ENV HSA_OVERRIDE_GFX_VERSION=11.0.2
 CMD ["python", "-c", "import torch; print(f'PyTorch {torch.__version__} HIP:{torch.version.hip}'); print(f'Devices: {torch.cuda.device_count() if torch.cuda.is_available() else 0}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}'); import sys; sys.exit(0 if torch.cuda.is_available() else 1)"]
 
 ENTRYPOINT ["python"]
+
+# ─── Wheel-only image ────────────────────────────────────────────
+# The final image installs the wheel into /opt/venv and then deletes
+# it, so the artifact that took half an hour to produce cannot be
+# recovered from it. This stage publishes the wheel itself: a scratch
+# image carrying nothing but /wheels, which buildx can push to Zot and
+# `COPY --from=` can consume, with no extra artifact store.
+#
+# Build it with `--target wheel` (bake target: pytorch-wheel). The
+# builder stage is shared, so with a warm layer cache this costs a
+# copy rather than a rebuild.
+FROM scratch AS wheel
+
+COPY --from=builder /opt/pytorch/dist/ /wheels/
+COPY --from=builder /opt/pytorch/build.log /opt/pytorch/sccache-stats.txt /

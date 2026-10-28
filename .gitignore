@@ -24,3 +24,6 @@ Thumbs.db
 .vscode/
 *.pyc
 telemetry/out/
+
+# Wheels extracted from Zot by `make wheel` / `triton-wheel` / `aiter-wheel`
+dist/

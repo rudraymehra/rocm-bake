@@ -1,0 +1,167 @@
+# syntax=docker/dockerfile:1
+# Triton built from source against this image's ROCm.
+#
+# Why build it at all: AMD publishes prebuilt triton only for ROCm 7.0,
+# 7.1 and 7.2 (https://pypi.amd.com/triton/release_0914/). Every 7.3+
+# and 10.x channel returns 403. Our runtime is ROCm 10.1, so there is no
+# matching wheel to install — AITER's own installer falls back to the
+# 7.2.0 channel, three ROCm majors behind.
+#
+# Why its own image rather than a stage of Dockerfile.pytorch: triton
+# requires cmake>=3.20,<4.0, while PyTorch pulls cmake 4.x and needs
+# CMAKE_POLICY_VERSION_MINIMUM=3.5 to tolerate its vendored deps. The two
+# constraints cannot share an environment.
+#
+# The version and commit are PyTorch's own pins, so the result is the
+# triton that v2.14.1 expects — just built for ROCm 10.1 instead of 7.2:
+#   .ci/docker/triton_version.txt        -> 3.8.0
+#   .ci/docker/ci_commit_pins/triton.txt -> 675c5987...
+
+ARG BASE_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/base:10.1.0-full-3.14
+FROM ${BASE_IMAGE} AS builder
+
+ARG TRITON_REF=675c59878aa2280b31f722aaf42b825fcee21de8
+ARG PYTORCH_ROCM_ARCH=gfx950
+ARG ROCM_VERSION=10.1.0-full
+ARG SCCACHE_WEBDAV_ENDPOINT=http://snoc-strix.fold-leaffish.ts.net:8081
+# Namespace this project's objects. The store is shared with other
+# projects on the same fleet, and while sccache's keys are content
+# hashes (so sharing is normally safe and desirable), entries written
+# while two containers' sccache servers were crossed over a host port
+# were wrong — a triton build hit them and died with "stdlib.h: No such
+# file or directory" on a system that compiles that header fine. Proven
+# by rebuilding under an isolated prefix: zero such errors.
+#
+# The crossing itself is fixed by SCCACHE_SERVER_UDS above, so this
+# prefix is about abandoning the already-poisoned entries without
+# deleting a store other projects are still using, and about bounding
+# the blast radius if it ever recurs.
+ARG SCCACHE_WEBDAV_KEY_PREFIX=rocm-pytorch
+# A unix socket, not a TCP port. The builders run with
+# --driver-opt network=host, so SCCACHE_SERVER_PORT is shared by every
+# container on the node. A concurrent vLLM build on snoc-strix held
+# 4250, our triton client connected to *its* sccache server, and that
+# server could not see /opt/triton in its own mount namespace:
+#
+#   sccache: error: failed to spawn Command { cd "/opt/triton/build/..."
+#   sccache: caused by: No such file or directory (os error 2)
+#
+# Same root cause as the long-settled "one shared sccache server is
+# impossible" finding: the server compiles from its own filesystem. A
+# socket inside the container cannot be reached by another container,
+# so each build necessarily gets its own server.
+# Empty means "derive from the node"; set it to pin a job count.
+ARG MAX_JOBS=
+
+LABEL org.opencontainers.image.source="https://github.com/triton-lang/triton"
+LABEL org.opencontainers.image.description="Triton built for ROCm ${ROCM_VERSION}, ${PYTORCH_ROCM_ARCH}"
+
+# MAX_JOBS is computed per node at build time, not fixed here. It was
+# 32, mirroring PyTorch CI, which assumed PyTorch CI's machines: on
+# snoc-strix (32 cores but only 30GB) 32 concurrent cc1plus wanted
+# ~48GB and the OOM killer took the build out at [180/511] with
+# "Killed signal terminated program cc1plus". Cores are the wrong
+# bound — memory is. Set MAX_JOBS explicitly to override the
+# computation; see the build step below.
+ENV ROCM_PATH=/opt/rocm \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+    SCCACHE_WEBDAV_ENDPOINT=${SCCACHE_WEBDAV_ENDPOINT} \
+    SCCACHE_SERVER_UDS=/tmp/sccache.sock \
+    SCCACHE_WEBDAV_KEY_PREFIX=${SCCACHE_WEBDAV_KEY_PREFIX} \
+    SCCACHE_IGNORE_CLIENT_VERSION=1 \
+    SCCACHE_CONF=/etc/sccache.toml \
+    SCCACHE_ERROR_LOG=/tmp/sccache-err.log \
+    SCCACHE_LOG=warn \
+    CMAKE_C_COMPILER_LAUNCHER=sccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+# sccache is installed in the base image's builder lineage, not here.
+ARG SCCACHE_VERSION=0.19.0
+RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    -o /tmp/sccache.tar.gz && \
+    tar xzf /tmp/sccache.tar.gz -C /usr/local/bin --strip-components=1 \
+        "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" && \
+    rm /tmp/sccache.tar.gz && chmod +x /usr/local/bin/sccache && sccache --version
+
+# Each RUN is a fresh container, so a build step has to start its own
+# sccache server, and startup probes the remote store. That probe is
+# bounded by a 10s timeout compiled into sccache — no environment
+# variable exists for it, only this config file field. Under load on the
+# node hosting the cache, 10s was not enough and the build died with
+# "Timed out waiting for server startup". The backend stays configured
+# by environment; this file carries only the timeout.
+RUN printf 'server_startup_timeout_ms = 60000\n' > /etc/sccache.toml
+
+# Submodules carry the in-tree backends, including amd.
+RUN git clone https://github.com/triton-lang/triton.git /opt/triton && \
+    cd /opt/triton && \
+    git checkout ${TRITON_REF} && \
+    git submodule update --init --recursive --depth 1
+
+WORKDIR /opt/triton
+
+# cmake<4 per triton's [build-system].requires. Installing it into the
+# venv shadows the system cmake for this build only.
+#
+# pybind11 is pinned to 3.0.1 to match PyTorch CI's recipe
+# (.ci/docker/common/install_triton.sh) rather than taking whatever
+# >=2.13.1 resolves to today.
+RUN pip install --no-cache-dir build "cmake>=3.20,<4.0" "ninja>=1.11.1" \
+        "pybind11==3.0.1" "setuptools>=40.8.0" wheel && \
+    cmake --version
+
+# PyTorch CI rewrites a stale LLVM build host here as a workaround for
+# triton#4527. At our pinned commit setup.py no longer references either
+# host, so the rewrite is a no-op — kept because it costs nothing and
+# older pins still need it. Deliberately not verified afterwards: `grep
+# -c` exits 1 on no match, which turned "workaround unnecessary" into a
+# failed build.
+RUN sed -i -e 's|https://tritonlang.blob.core.windows.net/llvm-builds|https://oaitriton.blob.core.windows.net/public/llvm-builds|g' setup.py && \
+    echo "llvm host references: $(grep -c 'blob.core.windows.net' setup.py || true)"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Triton fetches a prebuilt LLVM matching cmake/llvm-hash.txt unless
+# TRITON_LLVM_DIR points at one; the download dominates the first build.
+#
+# MAX_JOBS is derived from the node this lands on rather than fixed:
+# one cc1plus per job at ~2GB each, capped by core count. /proc is the
+# host's here, which is what we want — the balancer picks the node, and
+# this adapts to whichever it picked.
+RUN if [ -z "${MAX_JOBS}" ]; then \
+        cores=$(nproc); \
+        jobs=$(awk '/^MemAvailable:/ {print int($2/1024/1024/2)}' /proc/meminfo); \
+        [ -n "${jobs}" ] || jobs=${cores}; \
+        [ "${jobs}" -ge 1 ] || jobs=1; \
+        [ "${jobs}" -le "${cores}" ] || jobs=${cores}; \
+        export MAX_JOBS=${jobs}; \
+        echo "MAX_JOBS=${MAX_JOBS} (from ${cores} cores, $(awk '/^MemAvailable:/ {printf "%.0fGB", $2/1048576}' /proc/meminfo) available)"; \
+    else \
+        echo "MAX_JOBS=${MAX_JOBS} (pinned via build arg)"; \
+    fi; \
+    python -m build --wheel --no-isolation \
+    --outdir /wheels \
+    2>&1 | tee /wheels-build.log \
+    && sccache --show-stats | tee /wheels-sccache-stats.txt; rc=$?; echo "--- sccache error log: $(wc -c < /tmp/sccache-err.log 2>/dev/null || echo absent) bytes ---"; grep -iE 'error|warn|write' /tmp/sccache-err.log 2>/dev/null | grep -v 'read failed NotFound' | head -40; exit $rc
+
+# triton-kernels as well. AITER's installer takes a local wheelhouse via
+# TRITON_WHEEL_DIR, but only if BOTH triton and triton-kernels are in it
+# — otherwise it returns 1 and falls back to AMD's public index, which
+# has nothing newer than ROCm 7.2. Shipping only triton would silently
+# give us the mismatched build we are trying to avoid.
+RUN cd python/triton_kernels && \
+    python -m build --wheel --no-isolation --outdir /wheels \
+    2>&1 | tee -a /wheels-build.log
+
+RUN ls -la /wheels/
+
+# ─── Wheel-only image ────────────────────────────────────────────
+FROM scratch AS wheel
+
+ARG PYTORCH_ROCM_ARCH
+ARG ROCM_VERSION
+LABEL org.opencontainers.image.source="https://github.com/triton-lang/triton"
+LABEL org.opencontainers.image.description="Triton wheel for ROCm ${ROCM_VERSION}, ${PYTORCH_ROCM_ARCH}"
+
+COPY --from=builder /wheels/ /wheels/
+COPY --from=builder /wheels-build.log /wheels-sccache-stats.txt /

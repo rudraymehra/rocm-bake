@@ -112,7 +112,7 @@ Dockerfile.base          Dockerfile.pytorch        Dockerfile.runtime
         │                          │                        │
         ▼                          ▼                        ▼
   rocm/dev-ubu:7.14      ← pytorch 2.14.1 ← base image      ← pytorch wheel
-  + Python 3.12          + HIP/CUDA src   + sccache client  + runtime deps
+  + Python 3.14          + HIP/CUDA src   + sccache client  + runtime deps
   + dev tools            + ROCm tools      + env setup
   + NCCL/MKLDNN          + cmake + build   - build tools
   - ROCm headers         + sccache          only
@@ -230,6 +230,41 @@ unreachable, rather than spending an hour rebuilding uncached. Override
 with `--set '*.args.REQUIRE_SCCACHE=0'`. The build prints
 `sccache --show-stats` as its last action, which is where the telemetry
 wrapper reads the counters from.
+
+## Watching a build
+
+Everything here is a make target; nothing needs raw docker commands.
+
+```bash
+make watch                            # live, all snoc-* builders at once
+make watch WATCH_BUILDERS=snoc-think  # narrow to one
+make watch WATCH_LINES=40 WATCH_INTERVAL=2
+```
+
+`make watch` shows the build record table for every builder, and under
+each running build a live tail of its steps. It is the usual way to
+follow a build from a second terminal while the first runs `make`.
+
+For a single look rather than a live view:
+
+| Target | Shows |
+| --- | --- |
+| `make build-status` | Build records on `$(BUILDER)`: running, completed, errored, with durations |
+| `make build-logs` | The step output of a build — `BUILD=<id>`, default most recent |
+| `make build-inspect` | Duration, step count, cached steps, VCS revision |
+| `make builder-logs` | buildkitd's *own* log for each node: registry auth, cache GC, connection failures |
+| `make builder-status` | All builders and their nodes |
+| `make builder-restart` | Restart buildkitd on `$(BUILDER)`, clearing a wedged build |
+| `make cold-build` | Build with no layer cache and no compiler-cache hits |
+
+Two different logs are easy to confuse. `build-logs` is the output of
+the build's steps — what a `RUN` printed. `builder-logs` is the daemon
+underneath: it is where a registry failure, a DNS failure or a cache
+problem shows up, often while the build itself just looks slow.
+
+`make builder-restart` drops that node's in-memory build state. The
+registry layer cache and the shared compiler cache are untouched, so the
+next build still picks up where it can.
 
 ## Telemetry & Metrics
 
@@ -352,7 +387,7 @@ docker buildx bake -f bake.hcl \
 
 | Target | Description | Tags |
 |--------|-------------|------|
-| `pytorch-base` | ROCm dev base with Python/toolchain | `rocm-pytorch/base:10.1.0-full-3.12` |
+| `pytorch-base` | ROCm dev base with Python/toolchain | `rocm-pytorch/base:10.1.0-full-3.14` |
 | `pytorch` | Full PyTorch build with deps | `rocm-pytorch/pytorch:2.14.1-10.1.0-full-gfx950` |
 | `pytorch-run` | Minimal runtime image | `rocm-pytorch/runtime:2.14.1-10.1.0-full` |
 | `pytorch-test` | Build + verify test | `rocm-pytorch/pytorch:…-gfx950-test` |
@@ -417,6 +452,34 @@ Two different failures look similar from a build log:
   `insecure-registries` in `/etc/docker/daemon.json`; for BuildKit,
   confirm the builder was created with
   `--config .builders/buildkitd-strix.toml`.
+
+### Push dies at exactly 60 seconds
+
+Zot's default HTTP read timeout is 60s, measured across the whole request
+body. The ROCm base image has a single 8.67GB layer, which cannot cross a
+1Gb/s link in under ~73s, so every push of it failed at the 60s mark:
+Zot discarded the partial upload and returned 500, and buildkit retried
+with backoff. The client-side error is a connection reset, which reads
+like a network fault rather than a timeout — the giveaway is Zot's own
+log:
+
+```
+PUT /v2/.../blobs/uploads/...  statusCode: 500  latency: "1m0s"
+error: "read tcp ...: i/o timeout"   Content-Length: 8672333352
+```
+
+`/etc/zot/config.json` needs:
+
+```json
+"http": {
+  "readTimeout": "30m",
+  "writeTimeout": "30m"
+}
+```
+
+then `sudo systemctl restart zot`. That layer then pushes in ~200s. Zot
+is deployed from outside this repo, so the setting belongs in whatever
+provisions it, or it reverts on the next deploy.
 
 Both settings are fixed at builder-create time, so the fix is always
 `docker buildx rm <name>` then `make builder-<builder>`; editing the toml
