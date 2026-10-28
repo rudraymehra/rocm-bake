@@ -18,53 +18,45 @@ on:
 permissions:
   contents: read
 
+# Validation only, no builds. A GitHub-hosted runner cannot reach the
+# tailnet registry that every image but the base builds FROM, and the
+# ROCm base alone does not fit its disk, so building here can only fail.
+# These checks need neither: bake resolves every target without
+# building, and BuildKit's checks read each Dockerfile with only its
+# base images' metadata. Registry-only parents get public stand-ins.
 jobs:
   validate:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [pytorch-base, pytorch, pytorch-run, pytorch-test]
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Validate bake.hcl target syntax
+      - name: bake.hcl parses and every target resolves
+        run: docker buildx bake -f bake.hcl --print default wheels pytorch-test > /dev/null
+
+      # Two checks are skipped, each for a reason that holds only here:
+      #   SecretsUsedInArgOrEnv  fires on the word KEY in
+      #                          SCCACHE_WEBDAV_KEY_PREFIX, a cache path
+      #                          prefix rather than a credential
+      #   UndefinedVar           only where a stand-in parent is used: the
+      #                          real parent (our base) defines variables
+      #                          such as LD_LIBRARY_PATH that the public
+      #                          stand-in does not. Dockerfile.base keeps it.
+      - name: Dockerfile checks (BuildKit, no build)
         run: |
-          docker buildx bake -f bake.hcl --dry-run \
-            --set "*.platform=linux/amd64" \
-            --set "target.${{ matrix.target }}.tags=test:latest"
-
-      - name: Check Dockerfile syntax — base
-        if: matrix.target == 'pytorch-base'
-        run: docker build -f Dockerfile.base --progress=plain --target base .
-
-      - name: Check Dockerfile syntax — pytorch (no network deps)
-        if: matrix.target == 'pytorch'
-        run: |
-          docker build -f Dockerfile.pytorch \
-            --progress=plain \
-            --build-arg ROCM_VERSION=7.14 \
-            --build-arg PYTORCH_VERSION=2.14.1 \
-            --build-arg PYTORCH_ROCM_ARCH=gfx950 \
-            --build-arg PYTHON_VERSION=3.14 \
-            --target builder \
-            --network=host \
-            -t test-pytorch-builder .
-
-      - name: Check Dockerfile syntax — runtime
-        if: matrix.target == 'pytorch-run'
-        run: docker build -f Dockerfile.runtime --progress=plain --target final .
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: HCL lint — bake.hcl
-        uses: nicholarquinoh/hcledit-action@v1
-        with:
-          command: validate
-          path: bake.hcl
+          rocm=rocm/dev-ubuntu-26.04:10.1.0-full
+          check() { # check <skip-list> <Dockerfile> [build args...]
+            echo "== $2"
+            skip=$1 f=$2; shift 2
+            docker buildx build --call check --platform linux/amd64 \
+              --build-arg "BUILDKIT_DOCKERFILE_CHECK=skip=$skip" -f "$f" "$@" .
+          }
+          own=SecretsUsedInArgOrEnv
+          standin=SecretsUsedInArgOrEnv,UndefinedVar
+          check "$own" Dockerfile.base
+          check "$standin" Dockerfile.pytorch --build-arg BASE_IMAGE="$rocm" --build-arg TRITON_WHEEL_IMAGE=busybox
+          check "$standin" Dockerfile.triton --build-arg BASE_IMAGE="$rocm"
+          check "$standin" Dockerfile.aiter --build-arg PYTORCH_IMAGE="$rocm" --build-arg TRITON_WHEEL_IMAGE=busybox
+          check "$standin" Dockerfile.runtime --build-context pytorch=docker-image://busybox
