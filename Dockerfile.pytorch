@@ -354,8 +354,9 @@ ENV LD_LIBRARY_PATH=${ROCM_PATH}/lib:/opt/rocm/lib:$LD_LIBRARY_PATH
 # (docker run -e HSA_OVERRIDE_GFX_VERSION=...) rather than baking it
 # into every image.
 
-# Test entrypoint
-CMD ["python", "-c", "import torch; print(f'PyTorch {torch.__version__} HIP:{torch.version.hip}'); print(f'Devices: {torch.cuda.device_count() if torch.cuda.is_available() else 0}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}'); import sys; sys.exit(0 if torch.cuda.is_available() else 1)"]
+# Test entrypoint. CMD is appended to ENTRYPOINT, so it starts at "-c":
+# with "python" in both the container ran `python python -c ...`.
+CMD ["-c", "import torch; print(f'PyTorch {torch.__version__} HIP:{torch.version.hip}'); print(f'Devices: {torch.cuda.device_count() if torch.cuda.is_available() else 0}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}'); import sys; sys.exit(0 if torch.cuda.is_available() else 1)"]
 
 ENTRYPOINT ["python"]
 
