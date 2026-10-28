@@ -265,7 +265,7 @@ cache-logs: ## Follow the WebDAV store's access log
 builder-setup: builder-snoc-strix builder-snoc-think builder-snoc-gaming ## Setup all builders
 
 builder-snoc-strix: ## Setup the snoc-strix builder (local docker-container)
-	@if docker buildx ls --format '{{.Name}}' | grep -qx 'snoc-strix'; then \
+	@if docker buildx inspect snoc-strix > /dev/null 2>&1; then \
 		echo "snoc-strix builder already exists"; \
 	else \
 		echo "Creating snoc-strix builder..."; \
@@ -287,7 +287,7 @@ builder-snoc-strix: ## Setup the snoc-strix builder (local docker-container)
 # buildx plugin installed. Both are gfx1201 (RDNA4), so they can
 # cross-compile for gfx950 but cannot run the GPU test stage.
 builder-snoc-think: ## Setup the snoc-think builder (over SSH to snoc-thinkstation)
-	@if docker buildx ls --format '{{.Name}}' | grep -qx 'snoc-think'; then \
+	@if docker buildx inspect snoc-think > /dev/null 2>&1; then \
 		echo "snoc-think builder already exists"; \
 	else \
 		echo "Creating snoc-think builder..."; \
@@ -303,7 +303,7 @@ builder-snoc-think: ## Setup the snoc-think builder (over SSH to snoc-thinkstati
 	fi
 
 builder-snoc-gaming: ## Setup the snoc-gaming builder (over SSH)
-	@if docker buildx ls --format '{{.Name}}' | grep -qx 'snoc-gaming'; then \
+	@if docker buildx inspect snoc-gaming > /dev/null 2>&1; then \
 		echo "snoc-gaming builder already exists"; \
 	else \
 		echo "Creating snoc-gaming builder..."; \
@@ -323,7 +323,7 @@ builder-snoc-gaming: ## Setup the snoc-gaming builder (over SSH)
 # A single target still builds on one node — this is fan-out, not a
 # distributed compile of one image.
 builder-snoc-pool: ## Setup a 3-node pool (snoc-strix + snoc-think + snoc-gaming)
-	@if docker buildx ls --format '{{.Name}}' | grep -qx 'snoc-pool'; then \
+	@if docker buildx inspect snoc-pool > /dev/null 2>&1; then \
 		echo "snoc-pool builder already exists"; \
 	else \
 		echo "Creating snoc-pool builder..."; \
