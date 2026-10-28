@@ -1,5 +1,6 @@
 # PyTorch ROCm gfx950 Build - Buildx Bake Definition
-# Uses Zot registry for cache storage, remote builders on Strix/Think
+# Uses the bare-metal Zot registry on Strix for cache storage; build
+# nodes are Strix, snoc-thinkstation and snoc-gaming (see the Makefile)
 #
 # Targets:
 #   pytorch-base  - ROCm base with dev tools
@@ -12,15 +13,19 @@
 #   docker buildx bake -f bake.hcl                     # build all (local)
 #   docker buildx bake -f bake.hcl --push              # build + push to Zot
 #   docker buildx bake -f bake.hcl pytorch             # build just pytorch
-#   docker buildx bake -f bake.hcl --builder strix pytorch
-#   docker buildx bake -f bake.hcl --builder think pytorch
+#   docker buildx bake -f bake.hcl --builder snoc-strix pytorch
+#   docker buildx bake -f bake.hcl --builder snoc-think pytorch
 #
 # Override variables at build time:
 #   docker buildx bake -f bake.hcl --set 'target.pytorch.args.PYTORCH_VERSION=2.14.1'
 #   docker buildx bake -f bake.hcl --set 'target.pytorch.args.ROCM_VERSION=7.14'
 
+# Bare-metal zot on Strix (zot.service, /etc/zot/config.json), plain HTTP
+# on the tailnet. Resolving this name inside a build requires the builder
+# to have been created with --driver-opt network=host, which the
+# Makefile's builder-* targets do.
 variable "REGISTRY" {
-  default = "100.118.22.104:8080"
+  default = "snoc-strix.fold-leaffish.ts.net:8080"
 }
 
 variable "REGISTRY_NAME" {
@@ -28,7 +33,7 @@ variable "REGISTRY_NAME" {
 }
 
 variable "PYTORCH_VERSION" {
-  default = "2.14.0"
+  default = "2.14.1"
 }
 
 variable "ROCM_VERSION" {
@@ -57,6 +62,30 @@ variable "PYTHON_VERSION" {
 
 variable "GIT_REF" {
   default = ""
+}
+
+# Shared compiler cache on Strix, reachable from every build node. The
+# name resolves inside a build only because the buildkitd config sets
+# [dns] for the build sandbox; see .builders/buildkitd-strix.toml.
+variable "SCCACHE_MEMCACHED" {
+  default = "tcp://snoc-strix.fold-leaffish.ts.net:11211"
+}
+
+# Port for the sccache server started inside the build container. Must
+# not collide with the node's own sccache.service (4226), because
+# builders run with --driver-opt network=host.
+variable "SCCACHE_SERVER_PORT" {
+  default = "4250"
+}
+
+# 1 = refuse to start a PyTorch compile with no sccache server, rather
+# than spending an hour rebuilding everything uncached.
+variable "SCCACHE_RECACHE" {
+  default = "false"
+}
+
+variable "REQUIRE_SCCACHE" {
+  default = "1"
 }
 
 # ─── Shared build attributes ─────────────────────────────────────
@@ -115,14 +144,17 @@ target "pytorch" {
     USE_FLYDSL           = USE_FLYDSL
     USE_FLASH_ATTENTION  = USE_FLASH_ATTENTION
     GIT_REF              = GIT_REF
-  }
 
-  env = [
-    "SCCACHE_ADDR=localhost:9000",
-    "CMAKE_C_COMPILER_LAUNCHER=sccache",
-    "CMAKE_CXX_COMPILER_LAUNCHER=sccache",
-    "CMAKE_HIP_COMPILER_LAUNCHER=sccache",
-  ]
+    # The compiler-cache settings are build ARGs, not env. A bake target
+    # has no `env` attribute — the block that used to sit here was parsed
+    # as nothing, which is why no build was ever compiler-cached. The
+    # CMAKE_*_COMPILER_LAUNCHER values live in Dockerfile.pytorch; only
+    # the port and the strictness toggle are worth overriding here.
+    SCCACHE_MEMCACHED    = SCCACHE_MEMCACHED
+    SCCACHE_SERVER_PORT  = SCCACHE_SERVER_PORT
+    SCCACHE_RECACHE      = SCCACHE_RECACHE
+    REQUIRE_SCCACHE      = REQUIRE_SCCACHE
+  }
 
   output = ["type=image", "compression=zstd"]
 }
@@ -160,27 +192,17 @@ target "pytorch-test" {
   run-target = "test"
 }
 
-# ─── Remote builder: SNOC Strix (primary) ────────────────────────
-# Setup: docker buildx create --name strix --driver docker-container
-builder "strix" {
-  driver = "docker-container"
-  driver-opt = [
-    "env.BUILDKIT_STEP_LOG_MAX_SIZE=104857600",
-    "env.BUILDKIT_STEP_LOG_MAX_SPEED=10485760",
-    # Pass sccache environment variables to the builder container
-    "env.SCCACHE_ADDR=localhost:9000",
-    "env.CMAKE_C_COMPILER_LAUNCHER=sccache",
-    "env.CMAKE_CXX_COMPILER_LAUNCHER=sccache",
-    "env.CMAKE_HIP_COMPILER_LAUNCHER=sccache",
-  ]
-  platforms = ["linux/amd64"]
-}
-
-# ─── Remote builder: SNOC Think (secondary) ──────────────────────
-# Setup: docker buildx create --name think --driver remote tcp://snoc-think:1234
-#        Requires buildkitd running on Think with TLS certs
-builder "think" {
-  driver = "remote"
-  endpoint = "tcp://snoc-think:1234"
-  platforms = ["linux/amd64"]
-}
+# ─── Builders ────────────────────────────────────────────────────
+# Builders are NOT defined here. `builder` is not a bake HCL block type —
+# the blocks that used to sit here were parsed as nothing and silently
+# ignored. Builders are created with `docker buildx create`; see the
+# builder-* targets in the Makefile, which also pass the buildkitd config
+# that teaches each node to reach Zot over plain HTTP.
+#
+#   make builder-snoc-strix    # snoc-strix: local, gfx950, runs the GPU tests
+#   make builder-snoc-think    # snoc-think: snoc-thinkstation over SSH, gfx1201
+#   make builder-snoc-gaming   # snoc-gaming: over SSH, gfx1201
+#   make builder-snoc-pool     # snoc-pool: all three as one builder
+#
+# Select one per invocation with --builder:
+#   docker buildx bake -f bake.hcl --builder snoc-pool pytorch

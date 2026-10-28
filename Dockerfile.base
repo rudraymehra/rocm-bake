@@ -5,7 +5,7 @@
 ARG ROCM_VERSION=10.1.0-full
 ARG PYTHON_VERSION=3.12
 
-FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION} AS base
+FROM rocm/dev-ubuntu-26.04:${ROCM_VERSION} AS base
 
 LABEL org.opencontainers.image.source="https://github.com/your-org/rocm-pytorch-build"
 LABEL org.opencontainers.image.description="ROCm ${ROCM_VERSION} development base with Python ${PYTHON_VERSION}"

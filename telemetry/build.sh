@@ -1,0 +1,166 @@
+#!/bin/bash
+# build.sh - run a bake invocation and record telemetry for it.
+#
+# Usage: telemetry/build.sh [bake args...]
+#        telemetry/build.sh --builder snoc-pool pytorch
+#
+# Runs `docker buildx bake -f bake.hcl "$@"`, then writes Prometheus
+# metrics for every build that invocation produced: wall-clock duration,
+# BuildKit layer-cache hit ratio, and sccache compiler-cache counters.
+# Exits with the bake's own status, so it is safe to use in place of a
+# bare bake call.
+#
+# Metrics go to $TEXTFILE_DIR (default: node_exporter's textfile
+# collector) when that is writable, otherwise to ./telemetry/out. The
+# file is written to a temp path and renamed, so node_exporter never
+# reads a half-written file.
+#
+# Env:
+#   BUILDER       buildx builder to read history from (default: current)
+#   TEXTFILE_DIR  output directory
+#   BAKE_FILE     bake definition (default: bake.hcl)
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BAKE_FILE="${BAKE_FILE:-${REPO_ROOT}/bake.hcl}"
+TEXTFILE_DIR="${TEXTFILE_DIR:-/var/lib/node_exporter/textfile_collector}"
+FALLBACK_DIR="${REPO_ROOT}/telemetry/out"
+METRIC_FILE="rocm_pytorch_build.prom"
+
+for tool in docker jq; do
+    command -v "$tool" > /dev/null || { echo "$0: $tool is required" >&2; exit 1; }
+done
+
+# Resolve the builder now: `buildx history` needs a concrete name, and
+# the current builder can change under us between build and collection.
+BUILDER="${BUILDER:-$(docker buildx inspect 2>/dev/null | awk '/^Name:/ {print $2; exit}')}"
+[ -n "${BUILDER}" ] || BUILDER=default
+
+# Bake writes nothing we can correlate on, so bound the history query by
+# time instead. Second resolution is enough: a build takes minutes.
+START_EPOCH=$(date +%s)
+START_RFC=$(date -u -d "@${START_EPOCH}" +%Y-%m-%dT%H:%M:%SZ)
+
+echo "== bake: $* (builder=${BUILDER})"
+docker buildx bake -f "${BAKE_FILE}" "$@"
+BUILD_STATUS=$?
+END_EPOCH=$(date +%s)
+WALL_SECONDS=$((END_EPOCH - START_EPOCH))
+
+echo "== collecting telemetry (bake exit=${BUILD_STATUS}, ${WALL_SECONDS}s)"
+
+SAMPLES="$(mktemp)"
+trap 'rm -f "${SAMPLES}"' EXIT
+
+esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+BL="builder=\"$(esc "${BUILDER}")\""
+
+# One history record per target built. Anything created before this
+# invocation started belongs to an earlier build.
+#
+# `history ls` prints a qualified ref (builder/node/id) but `history
+# inspect` only accepts the bare id, so take the last path component.
+# Compare as epochs, not strings: created_at carries sub-second digits,
+# and "…:59.578Z" sorts before "…:59Z" lexicographically, so a string
+# compare drops any build started in the same second as this script.
+REFS=$(docker buildx history ls --builder "${BUILDER}" --format json 2>/dev/null \
+    | jq -r --argjson since "${START_EPOCH}" \
+        'select((.created_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) >= $since)
+         | .ref | split("/") | last' 2>/dev/null)
+
+[ -n "${REFS}" ] || echo "   no build records since ${START_RFC} (nothing built, or history unavailable)"
+
+for ref in ${REFS}; do
+    rec=$(docker buildx history inspect "${ref}" --builder "${BUILDER}" --format json 2>/dev/null)
+    [ -n "${rec}" ] || continue
+
+    name=$(jq -r '.Name // "unknown"' <<< "${rec}")
+    # Duration is nanoseconds; keep it as seconds with ms resolution.
+    duration=$(jq -r '(.Duration // 0) / 1000000000 | . * 1000 | round / 1000' <<< "${rec}")
+    total=$(jq -r '.NumTotalSteps // 0' <<< "${rec}")
+    cached=$(jq -r '.NumCachedSteps // 0' <<< "${rec}")
+    status=$(jq -r '.Status // "unknown"' <<< "${rec}")
+
+    ratio=0
+    [ "${total}" -gt 0 ] && ratio=$(awk -v c="${cached}" -v t="${total}" 'BEGIN{printf "%.4f", c/t}')
+
+    lbl="target=\"$(esc "${name}")\",${BL}"
+    {
+        echo "rocm_build_duration_seconds{${lbl}} ${duration}"
+        echo "rocm_build_steps_total{${lbl}} ${total}"
+        echo "rocm_build_steps_cached{${lbl}} ${cached}"
+        echo "rocm_build_layer_cache_hit_ratio{${lbl}} ${ratio}"
+        echo "rocm_build_target_success{${lbl}} $([ "${status}" = "completed" ] && echo 1 || echo 0)"
+    } >> "${SAMPLES}"
+
+    # sccache counters come from the build log: the server lives and dies
+    # with the build container, so its stats cannot be queried after the
+    # fact. Dockerfile.pytorch prints `sccache --show-stats` as the last
+    # thing the build step does.
+    # buildx writes the replayed build log to stderr, not stdout.
+    logs=$(docker buildx history logs "${ref}" --builder "${BUILDER}" 2>&1)
+    hits=$(grep -aE 'Cache hits +[0-9]+' <<< "${logs}" | tail -1 | grep -oE '[0-9]+$')
+    misses=$(grep -aE 'Cache misses +[0-9]+' <<< "${logs}" | tail -1 | grep -oE '[0-9]+$')
+
+    if [ -n "${hits:-}" ] && [ -n "${misses:-}" ]; then
+        tot=$((hits + misses))
+        sratio=0
+        [ "${tot}" -gt 0 ] && sratio=$(awk -v h="${hits}" -v t="${tot}" 'BEGIN{printf "%.4f", h/t}')
+        {
+            echo "rocm_build_sccache_hits{${lbl}} ${hits}"
+            echo "rocm_build_sccache_misses{${lbl}} ${misses}"
+            echo "rocm_build_sccache_hit_ratio{${lbl}} ${sratio}"
+        } >> "${SAMPLES}"
+    fi
+
+    echo "   ${name}: ${duration}s, ${cached}/${total} steps cached${hits:+, sccache ${hits} hits/${misses} misses}"
+done
+
+# Pick an output directory we can actually write to. Falling back keeps
+# the wrapper usable by an unprivileged user; it just means Prometheus
+# will not see the metrics.
+OUT_DIR="${TEXTFILE_DIR}"
+if ! { [ -d "${OUT_DIR}" ] && [ -w "${OUT_DIR}" ]; }; then
+    OUT_DIR="${FALLBACK_DIR}"
+    mkdir -p "${OUT_DIR}"
+    echo "   ${TEXTFILE_DIR} not writable, using ${OUT_DIR}"
+fi
+
+TMP_FILE="$(mktemp "${OUT_DIR}/.${METRIC_FILE}.XXXXXX")"
+trap 'rm -f "${SAMPLES}" "${TMP_FILE}"' EXIT
+
+emit_help() { # name type help
+    grep -q "^$1{" "${SAMPLES}" || return 0
+    printf '# HELP %s %s\n# TYPE %s %s\n' "$1" "$3" "$1" "$2"
+    grep "^$1{" "${SAMPLES}"
+}
+
+{
+    echo "# HELP rocm_build_invocation_duration_seconds Wall-clock seconds for the whole bake invocation."
+    echo "# TYPE rocm_build_invocation_duration_seconds gauge"
+    echo "rocm_build_invocation_duration_seconds{${BL}} ${WALL_SECONDS}"
+    echo "# HELP rocm_build_invocation_success 1 if the bake invocation exited 0."
+    echo "# TYPE rocm_build_invocation_success gauge"
+    echo "rocm_build_invocation_success{${BL}} $([ "${BUILD_STATUS}" -eq 0 ] && echo 1 || echo 0)"
+    echo "# HELP rocm_build_last_run_timestamp_seconds Unix time the invocation finished."
+    echo "# TYPE rocm_build_last_run_timestamp_seconds gauge"
+    echo "rocm_build_last_run_timestamp_seconds{${BL}} ${END_EPOCH}"
+
+    emit_help rocm_build_duration_seconds       gauge "BuildKit-reported duration per target."
+    emit_help rocm_build_steps_total            gauge "Build steps in the target."
+    emit_help rocm_build_steps_cached           gauge "Build steps served from the layer cache."
+    emit_help rocm_build_layer_cache_hit_ratio  gauge "Cached steps over total steps."
+    emit_help rocm_build_target_success         gauge "1 if the target completed."
+    emit_help rocm_build_sccache_hits           gauge "Compiler-cache hits during the target's build."
+    emit_help rocm_build_sccache_misses         gauge "Compiler-cache misses during the target's build."
+    emit_help rocm_build_sccache_hit_ratio      gauge "Compiler-cache hits over hits+misses."
+} > "${TMP_FILE}"
+
+chmod 644 "${TMP_FILE}"
+mv "${TMP_FILE}" "${OUT_DIR}/${METRIC_FILE}"
+rm -f "${SAMPLES}"
+trap - EXIT
+echo "== wrote ${OUT_DIR}/${METRIC_FILE}"
+
+exit "${BUILD_STATUS}"

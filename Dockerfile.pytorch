@@ -3,7 +3,7 @@
 # Builds PyTorch with HIP support optimized for RDNA3/4 architecture
 # Requires PyTorch 2.14.0+ and ROCm 10.1+
 
-ARG BASE_IMAGE=100.118.22.104:8080/rocm-pytorch/base:10.1.0-full-3.12
+ARG BASE_IMAGE=snoc-strix.fold-leaffish.ts.net:8080/rocm-pytorch/base:10.1.0-full-3.12
 FROM ${BASE_IMAGE} AS builder
 
 LABEL org.opencontainers.image.source="https://github.com/your-org/rocm-pytorch-build"
@@ -16,6 +16,10 @@ ARG USE_AITER=ON
 ARG USE_FLYDSL=ON
 ARG USE_FLASH_ATTENTION=ON
 ARG GIT_REF=""
+# Declared or the ENV references below expand to empty and the build
+# silently targets no GPU architecture at all.
+ARG PYTORCH_ROCM_ARCH=gfx950
+ARG PYTHON_VERSION=3.12
 
 RUN git clone --depth 1 --branch v${PYTORCH_VERSION} \
     https://github.com/pytorch/pytorch.git /opt/pytorch \
@@ -29,26 +33,57 @@ WORKDIR /opt/pytorch
 # ─── sccache compiler cache ──────────────────────────────────────
 # Install sccache binary (prebuilt from Mozilla releases)
 ARG SCCACHE_VERSION=0.7.7
-ARG TARGETARCH=amd64
-RUN ARCH=$(dpkg --print-architecture) && \
-    curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-${TARGETARCH}-unknown-linux-musl.tar.gz" \
+RUN curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
     -o /tmp/sccache.tar.gz && \
     mkdir -p /usr/local/bin && \
-    tar xzf /tmp/sccache.tar.gz -C /usr/local/bin sccache && \
+    tar xzf /tmp/sccache.tar.gz -C /usr/local/bin --strip-components=1 \
+        "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" && \
     rm /tmp/sccache.tar.gz && \
     chmod +x /usr/local/bin/sccache && \
     sccache --version
 
-# Configure sccache for large HIP/C++ builds
-# 200GB cache to handle full PyTorch rebuilds
-ENV SCCACHE_DIR=/var/cache/sccache \
-    SCCACHE_CACHE_SIZE=200G \
+# sccache runs its own server inside this container, backed by the shared
+# memcached on Strix. Three things here are load-bearing:
+#
+#  - memcached, not SCCACHE_DIR. A local directory is discarded with the
+#    layer, which is how this silently cached nothing before. The store
+#    is shared, so an object compiled on one node is a hit on the others,
+#    and extstore spills past its RAM ceiling onto Strix's disk.
+#  - A port no host process uses. The builder runs with network=host, so
+#    a client on 4226 would attach to the node's own sccache.service —
+#    and that server executes compiles in the *host* filesystem, where
+#    this container's sources do not exist (it fails with exit 254).
+#  - The tailnet name resolves only because .builders/buildkitd-strix.toml
+#    sets [dns] for the build sandbox. RUN steps do not inherit the
+#    builder's resolver, so without that block this fails with "cache
+#    storage failed to read ... I/O error" and the build silently falls
+#    back to no caching at all.
+ARG SCCACHE_MEMCACHED=tcp://snoc-strix.fold-leaffish.ts.net:11211
+ARG SCCACHE_SERVER_PORT=4250
+# true forces every compile to run and repopulate: a genuinely cold build.
+ARG SCCACHE_RECACHE=false
+ENV SCCACHE_MEMCACHED=${SCCACHE_MEMCACHED} \
+    SCCACHE_SERVER_PORT=${SCCACHE_SERVER_PORT} \
     SCCACHE_IGNORE_CLIENT_VERSION=1 \
-    SCCACHE_RECACHE=false
+    SCCACHE_RECACHE=${SCCACHE_RECACHE} \
+    CMAKE_C_COMPILER_LAUNCHER=sccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=sccache \
+    CMAKE_HIP_COMPILER_LAUNCHER=sccache
 
-# Create sccache cache directory with proper permissions
-RUN mkdir -p /var/cache/sccache && \
-    chmod 1777 /var/cache/sccache
+# Fail early and loudly rather than spending an hour rebuilding PyTorch
+# against a cache that silently is not there.
+ARG REQUIRE_SCCACHE=1
+RUN if sccache --show-stats > /dev/null 2>&1; then \
+        echo "sccache: server up, cache = ${SCCACHE_MEMCACHED}"; \
+    elif [ "${REQUIRE_SCCACHE}" = "1" ]; then \
+        echo "ERROR: sccache could not reach ${SCCACHE_MEMCACHED}." >&2; \
+        echo "  Check memcached.service on Strix, and that this" >&2; \
+        echo "  builder was created with --driver-opt network=host." >&2; \
+        echo "  Build anyway with --set '*.args.REQUIRE_SCCACHE=0'." >&2; \
+        exit 1; \
+    else \
+        echo "WARNING: no sccache cache; this build will not be cached." >&2; \
+    fi
 
 # ─── Build configuration ─────────────────────────────────────────
 # gfx950 is Strix Halo (RDNA 3.5 / CDNA 3 hybrid)
@@ -83,9 +118,17 @@ ENV ROCM_HOME=/opt/rocm \
     CMAKE_HIP_FLAGS="-DGPU_ARCHS=${PYTORCH_ROCM_ARCH}"
 
 # ─── Build PyTorch ───────────────────────────────────────────────
+# pipefail matters: without it the RUN takes tee's exit status, so a
+# failed compile reports success and only surfaces as a confusing empty
+# dist/ one step later.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 RUN python setup.py bdist_wheel \
     --dist-dir /opt/pytorch/dist \
-    2>&1 | tee /opt/pytorch/build.log
+    2>&1 | tee /opt/pytorch/build.log \
+    && sccache --show-stats | tee /opt/pytorch/sccache-stats.txt
+
+SHELL ["/bin/sh", "-c"]
 
 # Verify the wheel was built
 RUN ls -la /opt/pytorch/dist/
@@ -114,8 +157,16 @@ FROM ${BASE_IMAGE} AS final
 LABEL org.opencontainers.image.source="https://github.com/your-org/rocm-pytorch-build"
 LABEL org.opencontainers.image.description="Built PyTorch ${PYTORCH_VERSION} for gfx950"
 
+# Build records, kept so timing and cache-hit data survive the build
+# stage being discarded. `make build-report` reads sccache-stats.txt.
+COPY --from=builder /opt/pytorch/build.log /opt/pytorch/sccache-stats.txt /var/log/pytorch-build/
+
 # Install the built wheel
 COPY --from=builder /opt/pytorch/dist/*.whl /opt/pytorch/dist/*.whl
+
+# Carry the build log and the compiler-cache stats into the shipped
+# image; in the builder stage they are unreachable once the build ends.
+COPY --from=builder /opt/pytorch/build.log /opt/pytorch/sccache-stats.txt /var/log/pytorch-build/
 
 RUN pip install --no-cache-dir /opt/pytorch/dist/*.whl \
     && rm -rf /opt/pytorch/dist/*.whl \

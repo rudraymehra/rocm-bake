@@ -1,73 +1,86 @@
 # Buildkit daemon configuration for SNOC Strix (gfx950, ROCm)
-# Install: sudo cp buildkitd.toml /etc/buildkitd/buildkitd.toml
-#          sudo systemctl restart docker (docker-container driver)
-#          or: sudo systemctl restart buildkitd (standalone mode)
 #
-# For docker-container driver on Strix:
-#   docker buildx create --name strix --driver docker-container
+# For the docker-container driver (what `make builder-snoc-strix` does):
+#   docker buildx create --name snoc-strix --driver docker-container \
+#     --driver-opt network=host --config .builders/buildkitd-strix.toml
+# The config is baked in at create time — an existing builder does not
+# pick up edits to this file. Recreate it: docker buildx rm snoc-strix.
 #
-# For standalone mode on Think:
-#   sudo cp buildkitd.toml /etc/buildkitd/buildkitd.toml
-#   sudo systemctl enable --now buildkitd
+# network=host is not optional. Docker strips loopback nameservers when
+# it writes a container's resolv.conf, so a bridged builder falls back to
+# the upstream resolver and cannot resolve *.ts.net — the registry below
+# then fails with "no such host" mid-build. Sharing the host netns gives
+# the builder the host's resolver, MagicDNS included.
+#
+# For standalone buildkitd on snoc-thinkstation:
+#   sudo cp buildkitd-strix.toml /etc/buildkit/buildkitd.toml
+#   sudo systemctl restart buildkitd
+#
+# Only keys buildkitd actually understands belong here. Unknown keys are
+# not inert: a containerd worker pointed at a bad address takes the whole
+# daemon down in a 60-second restart loop.
+
+# RUN steps do NOT inherit the builder container's resolver — buildkit
+# writes its own /etc/resolv.conf for the build sandbox, defaulting to
+# 8.8.8.8. Without this block a build step cannot resolve any tailnet
+# name, so both the registry and the shared sccache store fail from
+# inside a build even though the node itself resolves them fine.
+# The public resolver second is load-bearing, not belt-and-braces: this
+# tailnet has no global nameservers, so MagicDNS SERVFAILs on anything
+# outside it. With 100.100.100.100 alone a build step resolves tailnet
+# names and nothing else — apt, pip and the pytorch clone all fail. The
+# resolver falls through to the next entry on SERVFAIL, so tailnet names
+# come from MagicDNS and the rest from upstream.
+[dns]
+  nameservers = ["100.100.100.100", "64.59.135.135", "8.8.8.8"]
+  searchDomains = ["fold-leaffish.ts.net"]
 
 [worker.oci]
   enabled = true
-  # Limit memory to avoid OOM on 64GB shared-memory Strix Halo
-  # Leaving ~16GB for the host + display
-  "netns.mode" = "separate"
-
-  # Resource limits for ROCm worker
-  "limits.memory" = "48g"
-  "limits.cpu" = "10"
-
-  # Mount the host's ROCm runtime AND sccache cache directory
-  mount = [
-    "/opt/rocm:/opt/rocm",
-    "/dev/kfd:/dev/kfd",
-    "/dev/dri:/dev/dri",
-    "/var/cache/sccache:/var/cache/sccache",
-  ]
-
-  # Enable security capabilities
-  "annotations.buildkit/oci/runtime" = "io.containerd.runc.v2"
+  platforms = ["linux/amd64"]
+  # 10 of the 16 cores, leaving headroom for the host and display
+  max-parallelism = 10
+  gc = true
+  gckeepstorage = "100GB"
 
 [worker.oci.labels]
   "com.snoc.platform" = "strix-halo"
   "com.snoc.gpu" = "gfx950"
 
+# The docker-container driver runs the OCI worker only. Enabling the
+# containerd worker here points it at buildkitd's own socket and crashes
+# the daemon on startup.
 [worker.containerd]
-  enabled = true
-  namespace = "buildkit"
-  # Limit memory similarly
-  "limits.memory" = "48g"
-  "limits.cpu" = "10"
-  # ROCm mounts for containerd worker
-  mount = [
-    "/opt/rocm:/opt/rocm",
-    "/dev/kfd:/dev/kfd",
-    "/dev/dri:/dev/dri",
-    "/var/cache/sccache:/var/cache/sccache",
-  ]
+  enabled = false
 
-  # Socket path (docker-container driver uses this)
-  "address" = "/run/buildkit/buildkitd.sock"
-
-[registry."docker.io"]
-  # Pull-through cache upstream for Docker Hub
-  mirrors = ["mirror.gcr.io"]
+# The bare-metal zot on Strix (zot.service, port 8080). It serves plain
+# HTTP on the tailnet, so buildkit needs http = true here or every pull
+# and every cache export fails on the TLS handshake.
+[registry."snoc-strix.fold-leaffish.ts.net:8080"]
   http = true
-  insecure = false
+  insecure = true
+
+# zot syncs library/**, rocm/**, moby/** and friends on demand, so point
+# the upstreams at it rather than egressing for every layer.
+[registry."docker.io"]
+  mirrors = ["snoc-strix.fold-leaffish.ts.net:8080"]
 
 [registry."ghcr.io"]
-  mirrors = []
-  http = true
-  insecure = false
+  mirrors = ["snoc-strix.fold-leaffish.ts.net:8080"]
 
-[registry."nvcr.io"]
-  mirrors = []
-  http = true
-  insecure = false
+[registry."quay.io"]
+  mirrors = ["snoc-strix.fold-leaffish.ts.net:8080"]
 
-[metrics]
-  enabled = true
-  address = ":9999"
+# No [grpc] debugAddress here on purpose. With network=host a fixed debug
+# port is bound on the host, so a second builder on the same machine
+# (strix and pool-strix both live here) dies with "address already in
+# use". Set it per-builder with --driver-opt if you need the metrics.
+
+# Not expressible here, despite earlier attempts in this file:
+#   - Host mounts (/opt/rocm, /dev/kfd, /dev/dri, /var/cache/sccache).
+#     buildkitd.toml has no `mount` key. Build steps get host paths via
+#     `RUN --mount=` in the Dockerfile; device access during a build
+#     needs an entitlement, and compiling for gfx950 does not need a GPU.
+#   - Memory/CPU ceilings. Those are container limits — set them on the
+#     builder container (docker update / --driver-opt) or in the
+#     buildkitd.service unit for standalone mode.
