@@ -13,10 +13,13 @@
 # Metrics go to $TEXTFILE_DIR (default: node_exporter's textfile
 # collector) when that is writable, otherwise to ./telemetry/out. The
 # file is written to a temp path and renamed, so node_exporter never
-# reads a half-written file.
+# reads a half-written file. Each builder and target set gets its own
+# file, so runs in parallel (balance.sh) or one after another on other
+# targets do not replace each other's metrics.
 #
 # Env:
-#   BUILDER       buildx builder to read history from (default: current)
+#   BUILDER       buildx builder to read history from, when the bake args
+#                 carry no --builder (default: current)
 #   TEXTFILE_DIR  output directory
 #   BAKE_FILE     bake definition (default: bake.hcl)
 
@@ -26,7 +29,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BAKE_FILE="${BAKE_FILE:-${REPO_ROOT}/bake.hcl}"
 TEXTFILE_DIR="${TEXTFILE_DIR:-/var/lib/node_exporter/textfile_collector}"
 FALLBACK_DIR="${REPO_ROOT}/telemetry/out"
-METRIC_FILE="rocm_pytorch_build.prom"
 
 for tool in docker jq; do
     command -v "$tool" > /dev/null || { echo "$0: $tool is required" >&2; exit 1; }
@@ -34,8 +36,22 @@ done
 
 # Resolve the builder now: `buildx history` needs a concrete name, and
 # the current builder can change under us between build and collection.
+# The --builder passed to bake wins: the Makefile passes the node it
+# chose there, while BUILDER in the environment can still be the pool
+# sentinel (snoc-pool) or unset.
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+    case "${args[i]}" in
+        --builder) BUILDER="${args[i + 1]:-}" ;;
+        --builder=*) BUILDER="${args[i]#--builder=}" ;;
+    esac
+done
 BUILDER="${BUILDER:-$(docker buildx inspect 2>/dev/null | awk '/^Name:/ {print $2; exit}')}"
 [ -n "${BUILDER}" ] || BUILDER=default
+
+# The Makefile passes the bake targets last.
+last="${*: -1}"
+METRIC_FILE="rocm_pytorch_build_$(printf '%s' "${BUILDER}_${last:-default}" | tr -c 'A-Za-z0-9_-' _).prom"
 
 # Bake writes nothing we can correlate on, so bound the history query by
 # time instead. Second resolution is enough: a build takes minutes.
